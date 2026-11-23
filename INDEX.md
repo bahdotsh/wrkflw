@@ -1,6 +1,6 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-22 06:55:49 UTC | Files: 282 | Lines: 128551
+> Generated: 2026-11-23 11:16:56 UTC | Files: 282 | Lines: 128658
 > Languages: JSON (4), Markdown (35), Rust (176), Shell (10), TOML (19), YAML (38)
 
 ## Directory Structure
@@ -1880,7 +1880,7 @@ wrkflw/
 
 ## BREAKING_CHANGES.md
 
-**Language:** Markdown | **Size:** 38.7 KB | **Lines:** 412
+**Language:** Markdown | **Size:** 38.8 KB | **Lines:** 412
 
 **Declarations:**
 
@@ -1904,7 +1904,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 306.3 KB | **Lines:** 11219
+**Language:** Markdown | **Size:** 307.8 KB | **Lines:** 11253
 
 **Declarations:**
 
@@ -4537,7 +4537,7 @@ wrkflw/
 
 ## crates/executor/src/setup_actions.rs
 
-**Language:** Rust | **Size:** 61.0 KB | **Lines:** 1508
+**Language:** Rust | **Size:** 62.1 KB | **Lines:** 1531
 
 **Imports:**
 - `std::collections::HashMap`
@@ -4642,7 +4642,10 @@ wrkflw/
 
 `pub(crate) fn runner_node_install() -> String`
 
-`fn node_tarball_install(major: &str) -> String`
+`enum NodeTarball`
+> Variants: `Fresh`, `Replace`
+
+`fn node_tarball_install(major: &str, into: NodeTarball) -> String`
 
 `pub(crate) fn nodesource_install(major: &str) -> String`
 
@@ -5668,7 +5671,7 @@ wrkflw/
 
 ## crates/parser/src/schema.rs
 
-**Language:** Rust | **Size:** 4.3 KB | **Lines:** 125
+**Language:** Rust | **Size:** 5.4 KB | **Lines:** 157
 
 **Imports:**
 - `jsonschema::JSONSchema`
@@ -5691,6 +5694,8 @@ wrkflw/
 
   `pub fn validate_json( &self, workflow_json: &Value, schema_type: SchemaType, ) -> Result<(), String>`
 
+
+`mod tests`
 
 ---
 
@@ -7028,7 +7033,7 @@ wrkflw/
 
 ## crates/trigger-filter/src/model.rs
 
-**Language:** Rust | **Size:** 16.1 KB | **Lines:** 420
+**Language:** Rust | **Size:** 16.8 KB | **Lines:** 434
 
 **Imports:**
 - `glob::{MatchOptions, Pattern, PatternError}`
@@ -7076,7 +7081,7 @@ wrkflw/
   `pub fn match_options() -> MatchOptions`
 
 
-`fn expand_inner_double_stars(source: &str) -> Vec<String>`
+`fn expand_inner_double_stars(source: &str) -> Result<Vec<String>, PatternError>`
 
 `mod glob_pattern_tests`
 
@@ -9175,7 +9180,7 @@ wrkflw/
 
 ## crates/wrkflw/src/compare_cmd.rs
 
-**Language:** Rust | **Size:** 96.8 KB | **Lines:** 2403
+**Language:** Rust | **Size:** 97.2 KB | **Lines:** 2407
 
 **Imports:**
 - `crate::git::line as git_line`
@@ -9224,7 +9229,7 @@ wrkflw/
 
 `const NO_DOCKER_ENGINE: &[&str] = &[ "docker: command not found", "docker: not found", "docker: No such file or directory", "Cannot connect to the Docker daemon", ]`
 
-`const NO_GITHUB_TOKEN: &[&str] = &[ "set the GH_TOKEN environment variable", "Bad credentials", // An action's `github-token` or `token` input, which defaults to the // job's token, refused as empty by `@actions/core`. "Input required and not supplied: github-token", "Input required and not supplied: token", ]`
+`const NO_GITHUB_TOKEN: &[&str] = &[ "set the GH_TOKEN environment variable", "Bad credentials", // `github-token`, which actions such as actions/github-script default // to the job's token, refused as empty by `@actions/core`. Not a bare // `token`: actions take a third party's token under that name too, // from a secret the job's token would not stand in for. "Input required and not supplied: github-token", ]`
 
 `fn lacked_github_token(failure: &Value) -> bool`
 
@@ -9238,7 +9243,7 @@ wrkflw/
 
 `fn lacked_service_token(failure: &Value) -> bool`
 
-`const NEEDS_X86_64: &[&str] = &[ "rosetta error: failed to open elf at /lib64/ld-linux-x86-64.so.2", "toolchain add stable-x86_64-unknown-linux-gnu", "exec format error", ]`
+`const NEEDS_X86_64: &[&str] = &[ "rosetta error: failed to open elf at /lib64/ld-linux-x86-64.so.2", "toolchain add stable-x86_64-unknown-linux-gnu", ]`
 
 `fn needed_x86_64(failure: &Value) -> bool`
 

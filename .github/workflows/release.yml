@@ -127,17 +127,26 @@ jobs:
           ref="${IMAGE#ghcr.io/}"
           name="${ref%%:*}"
           tag="${ref##*:}"
-          token=$(curl -fsS "https://ghcr.io/token?scope=repository:${name}:pull" | jq -r .token)
-          if ! curl -fsS -o /dev/null \
+          # Only a refusal says the package is private. Anything else, such
+          # as a network error or a 5xx left after curl's retries, says
+          # nothing about it, and asks for a rerun.
+          status=000
+          if token=$(curl -fsS --retry 3 --retry-connrefused \
+              "https://ghcr.io/token?scope=repository:${name}:pull" | jq -er .token); then
+            status=$(curl -sS --retry 3 --retry-connrefused -o /dev/null -w '%{http_code}' \
               -H "Authorization: Bearer ${token}" \
               -H "Accept: application/vnd.oci.image.index.v1+json" \
-              "https://ghcr.io/v2/${name}/manifests/${tag}"; then
-            message="${IMAGE} can't be pulled anonymously: make the package public in its settings, or wrkflw builds the image on each machine"
-            case "$RELEASE_TAG" in
-              *-*) echo "::warning::${message}" ;;
-              *) echo "::error::${message}"; exit 1 ;;
-            esac
+              "https://ghcr.io/v2/${name}/manifests/${tag}") || status=000
           fi
+          case "$status" in
+            200) exit 0 ;;
+            401|403|404) message="${IMAGE} can't be pulled anonymously: make the package public in its settings, or wrkflw builds the image on each machine" ;;
+            *) message="couldn't tell whether ${IMAGE} can be pulled anonymously (HTTP ${status}): rerun this job" ;;
+          esac
+          case "$RELEASE_TAG" in
+            *-*) echo "::warning::${message}" ;;
+            *) echo "::error::${message}"; exit 1 ;;
+          esac
 
   build:
     name: Build (${{ matrix.target }})

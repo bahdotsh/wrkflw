@@ -173,22 +173,24 @@ mod tests {
 /// `docs/**.md`, where it matches any characters, `/` included. The `glob`
 /// crate only takes `**` as a whole component, so such a pattern compiles
 /// to a few that together match the same: `pattern` and `alternatives`.
-/// Match with [`GlobPattern::matches`], which tries them all.
+/// Match with [`GlobPattern::matches`], which tries them all; they are
+/// private, so nothing can match against only the first.
 #[derive(Debug, Clone)]
 pub struct GlobPattern {
     pub source: String,
-    pub pattern: Pattern,
+    pattern: Pattern,
     alternatives: Vec<Pattern>,
 }
 
 /// At most this many patterns stand for one source pattern: each component
-/// with `**` inside it doubles them.
+/// with `**` inside it doubles them, so four such components fit and a
+/// fifth is refused rather than matched with less than it says.
 const MAX_GLOB_ALTERNATIVES: usize = 16;
 
 impl GlobPattern {
     pub fn new(source: impl Into<String>) -> Result<Self, PatternError> {
         let source = source.into();
-        let mut compiled = expand_inner_double_stars(&source)
+        let mut compiled = expand_inner_double_stars(&source)?
             .iter()
             .map(|alternative| Pattern::new(alternative))
             .collect::<Result<Vec<_>, _>>()?
@@ -227,10 +229,13 @@ impl GlobPattern {
 /// `source`. A component holding `**` next to other characters, `P**S`,
 /// matches `P`, anything, then `S`: within one component that is `P*S`, and
 /// across several `P*/**/*S`. Patterns with no such component come back
-/// unchanged, alone.
-fn expand_inner_double_stars(source: &str) -> Vec<String> {
+/// unchanged, alone. More than [`MAX_GLOB_ALTERNATIVES`] is an error.
+fn expand_inner_double_stars(source: &str) -> Result<Vec<String>, PatternError> {
     let mut expanded = vec![String::new()];
+    let mut offset = 0;
     for (index, component) in source.split('/').enumerate() {
+        let start = offset;
+        offset += component.len() + 1;
         let choices: Vec<String> = match component.find("**") {
             Some(at) if component != "**" => {
                 let prefix = &component[..at];
@@ -243,8 +248,12 @@ fn expand_inner_double_stars(source: &str) -> Vec<String> {
             }
             _ => vec![component.to_string()],
         };
-        let fits = expanded.len() * choices.len() <= MAX_GLOB_ALTERNATIVES;
-        let choices = if fits { choices } else { choices[..1].to_vec() };
+        if expanded.len() * choices.len() > MAX_GLOB_ALTERNATIVES {
+            return Err(PatternError {
+                pos: start,
+                msg: "too many path components with `**` inside them (at most 4)",
+            });
+        }
         expanded = expanded
             .iter()
             .flat_map(|head| {
@@ -258,7 +267,7 @@ fn expand_inner_double_stars(source: &str) -> Vec<String> {
             })
             .collect();
     }
-    expanded
+    Ok(expanded)
 }
 
 /// Parsed trigger configuration for a single event type (e.g., push, pull_request).
@@ -413,8 +422,13 @@ mod glob_pattern_tests {
     }
 
     #[test]
-    fn many_inner_double_stars_stay_bounded() {
-        let pattern = GlobPattern::new("a**/b**/c**/d**/e**/f**").unwrap();
-        assert!(pattern.matches("a/b/c/d/e/f"));
+    fn four_inner_double_stars_match_fully_and_a_fifth_is_refused() {
+        let pattern = GlobPattern::new("a**/b**/c**/d**").unwrap();
+        assert!(pattern.matches("a/b/c/d"));
+        // Each component's `**` crosses directories, the last one's too.
+        assert!(pattern.matches("a1/x/b2/c3/y/z/d4"));
+        assert!(pattern.matches("a/b/c/x/d"));
+        let refused = GlobPattern::new("a**/b**/c**/d**/e**").unwrap_err();
+        assert_eq!(refused.pos, "a**/b**/c**/d**/".len());
     }
 }

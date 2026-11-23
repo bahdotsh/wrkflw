@@ -4,7 +4,7 @@
 
 A local job has no GitHub token unless `WRKFLW_JOB_GITHUB_TOKEN=1` gives it yours, so `actions/github-script`'s `github-token` input, which defaults to the job's token, was empty, and the action stopped before running its script with "Input required and not supplied: github-token". It now gets `wrkflw-no-github-token` instead: a script that never calls the API, such as the one inside `codecov/codecov-action`, runs as it does on GitHub, and one that calls it fails with a 401, as it would have failed before. A script that tested the token for being empty sees a value now.
 
-In `wrkflw-trigger-filter`, a pattern with `**` inside a path component, such as `**.go`, used to be refused, and now compiles to several `glob` patterns. `GlobPattern` has a private field for them, so it can no longer be built with a struct literal: use `GlobPattern::new`. Match with `GlobPattern::matches(text)` rather than `pattern.matches_with(text, GlobPattern::match_options())`, which only tries the first of them.
+In `wrkflw-trigger-filter`, a pattern with `**` inside a path component, such as `**.go`, used to be refused, and now compiles to several `glob` patterns; one with more than four such components is still refused. `GlobPattern`'s compiled patterns are private, `pattern` included, so it can no longer be built with a struct literal (use `GlobPattern::new`) and `pattern.matches_with(text, GlobPattern::match_options())` no longer compiles: match with `GlobPattern::matches(text)`, which tries all of them. `source` stays public.
 
 ## JavaScript actions run (0.9.0)
 

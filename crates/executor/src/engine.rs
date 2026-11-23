@@ -4677,11 +4677,6 @@ impl JobServices<'_> {
     }
 }
 
-/// Flush pending cache saves. Called at end-of-job only when the job succeeded,
-/// matching GitHub Actions' behavior where `actions/cache` saves in a post-step
-/// hook that only runs after all steps complete and the job succeeds.
-/// Whether `result` is a job that ran and passed, so what it used stands
-/// for a whole run of it.
 /// Whether a job's measured memory says what it needs: it passed, or it
 /// failed with every step after the first failure still run, as when only
 /// its last step, such as a coverage upload, failed. A job stopped part way
@@ -4725,6 +4720,9 @@ fn leg_family_memory_id(workflow: &str, job: &str) -> Option<String> {
     job_memory_id(workflow, &format!("{job}\0legs"))
 }
 
+/// Flush pending cache saves. Called at end-of-job only when the job succeeded,
+/// matching GitHub Actions' behavior where `actions/cache` saves in a post-step
+/// hook that only runs after all steps complete and the job succeeds.
 async fn flush_pending_cache_saves(
     pending: &std::sync::Mutex<Vec<PendingCacheSave>>,
     cache_store: &crate::cache::CacheStore,
@@ -5499,11 +5497,14 @@ fn checkout_destination(ctx: &StepExecutionContext<'_>) -> Result<PathBuf, Strin
     };
     let relative = workspace_relative_input(&path, ctx.job_env);
     let relative = Path::new(&relative);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
+    // Only plain names: `..`, a root and, on Windows, a drive prefix all
+    // leave the workspace, and `/elsewhere` is not `is_absolute()` there.
+    if relative.components().any(|c| {
+        !matches!(
+            c,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    }) {
         return Err(format!(
             "actions/checkout: path '{path}' is not under the workspace"
         ));
@@ -5904,6 +5905,18 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
     // `toJSON(env)` sees.
     let mut step_env = ctx.job_env.clone();
     let mut step_user_env = ctx.job_user_env.clone();
+    // A `run:` step's env reaches its container, where `${{
+    // github.action_path }}` is the container's path, as in its script.
+    let mut container_lookup = ctx
+        .step
+        .run
+        .as_ref()
+        .and_then(|_| container_action_path(ctx.job_env))
+        .map(|path| {
+            let mut env = step_env.clone();
+            env.insert("GITHUB_ACTION_PATH".to_string(), path);
+            env
+        });
 
     // Add step-level environment variables (with secret + expression substitution)
     for (key, value) in &ctx.step.env {
@@ -5923,7 +5936,8 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             value.clone()
         };
         // Resolve ${{ }} expressions in env values (e.g. ${{inputs.toolchain}})
-        let env_expr_ctx = ctx.expr_context_with_env(&step_env, &step_user_env);
+        let lookup = container_lookup.as_ref().unwrap_or(&step_env);
+        let env_expr_ctx = ctx.expr_context_with_env(lookup, &step_user_env);
         let resolved_value = match crate::substitution::preprocess_expressions(
             &resolved_value,
             ctx.working_dir,
@@ -5932,6 +5946,9 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             Ok(r) => r,
             Err(_) => resolved_value,
         };
+        if let Some(lookup) = container_lookup.as_mut() {
+            lookup.insert(key.clone(), resolved_value.clone());
+        }
         step_env.insert(key.clone(), resolved_value.clone());
         step_user_env.insert(key.clone(), resolved_value);
     }
@@ -7147,9 +7164,6 @@ fn prepare_step_container_context(
 
 type VolumePathPair = (PathBuf, PathBuf);
 
-/// True when steps execute inside a Docker/Podman/Kubernetes container
-/// rather than on the host. The mode is seeded from the runtime `initialize_runtime`
-/// returned, so `Auto` and any fallback to emulation are already resolved.
 /// Where a composite or JavaScript action's directory is inside the job's
 /// container, for an `env` that names one and runs in a container: what
 /// [`prepare_container_mounts`] sets $GITHUB_ACTION_PATH to.
@@ -7163,6 +7177,9 @@ fn container_action_path(env: &HashMap<String, String>) -> Option<String> {
     Some(container.to_string_lossy().to_string())
 }
 
+/// True when steps execute inside a Docker/Podman/Kubernetes container
+/// rather than on the host. The mode is seeded from the runtime `initialize_runtime`
+/// returned, so `Auto` and any fallback to emulation are already resolved.
 fn uses_container_runtime(step_env: &HashMap<String, String>) -> bool {
     step_env
         .get("WRKFLW_RUNTIME_MODE")
@@ -12781,6 +12798,21 @@ runs:
     #[test]
     fn a_node_major_comes_from_nodejs_org_before_nodesource() {
         let install = get_install_script("node", "19");
+        // The new build is run before the runner's Node is touched, and the
+        // runner's npm, corepack and headers go before the copy, so the
+        // other major leaves no files behind.
+        let checked = install
+            .find("node/bin/node --version >/dev/null && ")
+            .unwrap();
+        let cleared = install
+            .find("rm -rf /usr/local/lib/node_modules/npm ")
+            .unwrap();
+        let copied = install.find("cp -a node/. /usr/local/").unwrap();
+        assert!(checked < cleared && cleared < copied, "{install}");
+        assert!(install.contains("/usr/local/include/node && "), "{install}");
+        // The runner image's own install, with no Node to replace, is as it
+        // was: it is part of the image's tag.
+        assert!(!runner_node_install().contains("rm -rf /usr/local/lib"));
         assert!(
             install.starts_with("(dir=$(mktemp -d)")
                 && install.contains("https://nodejs.org/dist/latest-v19.x/SHASUMS256.txt")
@@ -18592,8 +18624,10 @@ name: test action
 runs:
   using: composite
   steps:
-    - run: ${{ github.action_path }}/entrypoint.sh
+    - run: ${{ github.action_path }}/entrypoint.sh "$CONFIG"
       shell: bash
+      env:
+        CONFIG: ${{ github.action_path }}/config.toml
 "#,
         )
         .unwrap();
@@ -18635,6 +18669,13 @@ runs:
         );
         let host = action_dir.path().canonicalize().unwrap();
         assert!(!command.contains(&*host.to_string_lossy()), "{command}");
+        // The step's `env:` reaches the container too.
+        let config = calls[0]
+            .env_vars
+            .iter()
+            .find(|(key, _)| key == "CONFIG")
+            .map(|(_, value)| value.as_str());
+        assert_eq!(config, Some("/github/action/config.toml"), "{calls:?}");
     }
 
     #[test]
@@ -18657,6 +18698,18 @@ runs:
         assert!(!ran_every_step(&[
             step(Failure),
             step(Skipped),
+            step(Skipped)
+        ]));
+        // An `if: always()` step after the failure ran; one skipped by its
+        // own `if:` after it can't be told from one the failure stopped.
+        assert!(ran_every_step(&[
+            step(Failure),
+            step(Success),
+            step(Success)
+        ]));
+        assert!(!ran_every_step(&[
+            step(Failure),
+            step(Success),
             step(Skipped)
         ]));
         // Nothing failed, so nothing to say for a failed job.

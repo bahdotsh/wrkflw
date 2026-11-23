@@ -123,3 +123,35 @@ impl SchemaValidator {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{SchemaType, SchemaValidator};
+
+    /// GitHub takes a single trigger filter pattern as a string, as well as
+    /// a list of them.
+    #[test]
+    fn a_trigger_filter_may_be_one_pattern_as_a_string() {
+        let validator = SchemaValidator::new().unwrap();
+        let workflow = |filter: &str| {
+            format!(
+                "on:\n  push:\n{filter}\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+            )
+        };
+        for filter in [
+            "    branches: \"**\"",
+            "    paths: \"**.go\"",
+            "    branches: [main, \"release/**\"]",
+        ] {
+            let result =
+                validator.validate_with_specific_schema(&workflow(filter), SchemaType::GitHub);
+            assert!(result.is_ok(), "{filter}: {result:?}");
+        }
+        // An empty pattern is still refused, alone or in a list.
+        for filter in ["    branches: \"\"", "    branches: [\"\"]"] {
+            let result =
+                validator.validate_with_specific_schema(&workflow(filter), SchemaType::GitHub);
+            assert!(result.is_err(), "{filter}");
+        }
+    }
+}

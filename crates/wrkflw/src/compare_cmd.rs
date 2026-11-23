@@ -331,10 +331,11 @@ const NO_DOCKER_ENGINE: &[&str] = &[
 const NO_GITHUB_TOKEN: &[&str] = &[
     "set the GH_TOKEN environment variable",
     "Bad credentials",
-    // An action's `github-token` or `token` input, which defaults to the
-    // job's token, refused as empty by `@actions/core`.
+    // `github-token`, which actions such as actions/github-script default
+    // to the job's token, refused as empty by `@actions/core`. Not a bare
+    // `token`: actions take a third party's token under that name too,
+    // from a secret the job's token would not stand in for.
     "Input required and not supplied: github-token",
-    "Input required and not supplied: token",
 ];
 
 /// Whether a failed step's output shows it had no GitHub token.
@@ -386,7 +387,6 @@ fn lacked_service_token(failure: &Value) -> bool {
 const NEEDS_X86_64: &[&str] = &[
     "rosetta error: failed to open elf at /lib64/ld-linux-x86-64.so.2",
     "toolchain add stable-x86_64-unknown-linux-gnu",
-    "exec format error",
 ];
 
 /// Whether a failed step's output shows it needed an x86_64 machine.
@@ -2289,15 +2289,14 @@ mod tests {
             "error: attestation does not match",
             "npm error code E401: HTTP 401 Unauthorized",
             "setup: if this fails, run gh auth login first",
+            // A third party's token from a secret the run doesn't have.
+            "Error: Input required and not supplied: token",
         ] {
             let note = note_after(own);
             assert!(!note.contains("WRKFLW_JOB_GITHUB_TOKEN"), "{note}");
         }
     }
 
-    /// A job whose step ran an x86_64 program in an arm64 container, as
-    /// `cross` on an Apple Silicon Mac does, says so; a failure of its own
-    /// doesn't.
     #[test]
     fn an_upload_refused_for_want_of_a_secret_token_says_so() {
         let dir = tempfile::tempdir().unwrap();
@@ -2356,6 +2355,9 @@ mod tests {
         );
     }
 
+    /// A job whose step ran an x86_64 program in an arm64 container, as
+    /// `cross` on an Apple Silicon Mac does, says so; a failure of its own
+    /// doesn't.
     #[test]
     fn a_failure_for_want_of_an_x86_64_machine_says_so() {
         let dir = tempfile::tempdir().unwrap();
@@ -2378,6 +2380,8 @@ mod tests {
             assert!(note_after(line).contains("x86_64"), "{line}");
         }
         assert!(!note_after("error[E0308]: mismatched types").contains("x86_64"));
+        // A bad shebang or a broken binary says this on any machine.
+        assert!(!note_after("./run.sh: exec format error").contains("x86_64"));
     }
 
     /// GitHub trims a job's name: a folded `name: >` ends in a newline,

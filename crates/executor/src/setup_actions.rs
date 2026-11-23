@@ -967,7 +967,7 @@ pub(crate) fn get_install_script(language: &str, version: &str) -> String {
             if !major.is_empty() && major.bytes().all(|b| b.is_ascii_digit()) {
                 format!(
                     "({}) || ({})",
-                    node_tarball_install(major),
+                    node_tarball_install(major, NodeTarball::Replace),
                     nodesource_install(major)
                 )
             } else {
@@ -1262,16 +1262,39 @@ pub(crate) const RUNNER_NODE_MAJOR: &str = "22";
 pub(crate) fn runner_node_install() -> String {
     format!(
         "(command -v node >/dev/null 2>&1 || ({}) || ({}))",
-        node_tarball_install(RUNNER_NODE_MAJOR),
+        node_tarball_install(RUNNER_NODE_MAJOR, NodeTarball::Fresh),
         nodesource_install(RUNNER_NODE_MAJOR),
     )
+}
+
+/// Where [`node_tarball_install`] puts Node.js.
+#[derive(Clone, Copy)]
+enum NodeTarball {
+    /// Under a `/usr/local` with no Node in it: the runner image's own,
+    /// installed only when `command -v node` finds none. Its text is part
+    /// of `docker/runner.Dockerfile`, and so of the image's tag.
+    Fresh,
+    /// Over the runner's Node in `/usr/local`, for setup-node. The new
+    /// build has to run before anything is removed, so a machine it can't
+    /// run on falls back to nodesource with the runner's Node intact, and
+    /// the old `npm`, `corepack` and headers go before the copy, so no
+    /// file of the other major stays among the new ones.
+    Replace,
 }
 
 /// Installs the newest release of Node.js `major` from nodejs.org, as
 /// [`runner_node_install`] describes, failing on a machine nodejs.org builds
 /// nothing for.
-fn node_tarball_install(major: &str) -> String {
+fn node_tarball_install(major: &str, into: NodeTarball) -> String {
     let dist = format!("https://nodejs.org/dist/latest-v{major}.x");
+    let replace = match into {
+        NodeTarball::Fresh => "",
+        NodeTarball::Replace => {
+            "node/bin/node --version >/dev/null && \
+             rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
+             /usr/local/include/node && "
+        }
+    };
     format!(
         "dir=$(mktemp -d) && (\
          cd \"$dir\" && \
@@ -1283,7 +1306,7 @@ fn node_tarball_install(major: &str) -> String {
          grep \" $file\\$\" SHASUMS256.txt > node.sum && sha256sum -c node.sum >/dev/null && \
          mkdir node && tar -xzf \"$file\" -C node --strip-components=1 --no-same-owner \
          --exclude='*/CHANGELOG.md' --exclude='*/LICENSE' --exclude='*/README.md' && \
-         cp -a node/. /usr/local/); \
+         {replace}cp -a node/. /usr/local/); \
          status=$?; [ -z \"$dir\" ] || rm -rf \"$dir\"; exit $status",
     )
 }

@@ -4,7 +4,10 @@ name: Release
 # archives, publishes the runner base image and makes a GitHub pre-release,
 # and leaves crates.io alone. Use one to try scripts/install.sh
 # (WRKFLW_VERSION=v0.9.0-rc.1) and to make a new runner image's package
-# public before the release that needs it.
+# public before the release that needs it. A rehearsal only warns about a
+# private package, so once it is public, rerun its "Publish the runner base
+# image" job and see it pass with no warning: that is the check a release
+# stops on, and the rehearsal is the only place it runs before one.
 on:
   push:
     tags:

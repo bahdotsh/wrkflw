@@ -1,6 +1,6 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-23 11:49:49 UTC | Files: 282 | Lines: 128858
+> Generated: 2026-11-23 13:13:27 UTC | Files: 282 | Lines: 128966
 > Languages: JSON (4), Markdown (35), Rust (176), Shell (10), TOML (19), YAML (38)
 
 ## Directory Structure
@@ -1906,7 +1906,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 308.0 KB | **Lines:** 11258
+**Language:** Markdown | **Size:** 308.4 KB | **Lines:** 11266
 
 **Declarations:**
 
@@ -2674,7 +2674,7 @@ wrkflw/
 
 ## crates/executor/src/checkout_sync.rs
 
-**Language:** Rust | **Size:** 67.3 KB | **Lines:** 1676
+**Language:** Rust | **Size:** 69.6 KB | **Lines:** 1732
 
 **Imports:**
 - `crate::engine::ExecutionError`
@@ -2687,6 +2687,8 @@ wrkflw/
 `fn create_gitignore_matcher( dir: &Path, ) -> Result<Option<ignore::gitignore::Gitignore>, ExecutionError>`
 
 `pub(crate) fn copy_directory_contents(from: &Path, to: &Path) -> Result<(), ExecutionError>`
+
+`pub(crate) fn checkout_into( from: &Path, workspace: &Path, to: &Path, ) -> Result<(), ExecutionError>`
 
 `struct GitDirs`
 > Fields: `own: PathBuf`, `common: PathBuf`
@@ -2732,7 +2734,7 @@ wrkflw/
 
 
 **`impl SyncRules`**
-  `fn for_root(root: &Path, workspace: &Path) -> Result<Self, ExecutionError>`
+  `fn for_root(root: &Path, workspace: &Path, to: &Path) -> Result<Self, ExecutionError>`
 
   `fn record_tracked(&self)`
 
@@ -3306,7 +3308,7 @@ wrkflw/
 
 ## crates/executor/src/job_memory.rs
 
-**Language:** Rust | **Size:** 38.6 KB | **Lines:** 1017
+**Language:** Rust | **Size:** 38.7 KB | **Lines:** 1019
 
 **Imports:**
 - `std::collections::HashMap`
@@ -3375,7 +3377,7 @@ wrkflw/
   `fn drop(&mut self)`
 
 
-`pub(crate) async fn metered<F: std::future::Future>( future: F, succeeded: impl FnOnce(&F::Output) -> bool, ) -> F::Output`
+`pub(crate) async fn metered<F: std::future::Future>( future: F, ran_to_its_end: impl FnOnce(&F::Output) -> bool, ) -> F::Output`
 
 `struct Release(Arc<JobMeter>)`
 
@@ -3436,9 +3438,9 @@ wrkflw/
 
 `fn keep( store: &mut Store, id: &str, family: Option<&str>, outcome: Outcome, sized_by_matrix: bool, now: i64, ) -> bool`
 
-`fn record(id: &str, family: Option<&str>, meter: &JobMeter, passed: bool) -> bool`
+`fn record(id: &str, family: Option<&str>, meter: &JobMeter, whole: bool) -> bool`
 
-`fn to_keep(outcome: Outcome, passed: bool) -> Option<Outcome>`
+`fn to_keep(outcome: Outcome, whole: bool) -> Option<Outcome>`
 
 `fn apply(store: &mut Store, id: &str, outcome: Outcome, now: i64)`
 
@@ -5076,7 +5078,7 @@ wrkflw/
 
 ## crates/executor/src/workspace.rs
 
-**Language:** Rust | **Size:** 25.8 KB | **Lines:** 744
+**Language:** Rust | **Size:** 27.5 KB | **Lines:** 786
 
 **Imports:**
 - `std::fs::File`
@@ -5118,7 +5120,11 @@ wrkflw/
   `fn keep( root: &Path, repo: &Path, file: &Path, workflow: &str, job: &str, ) -> std::io::Result<Option<Self>>`
 
 
-`pub(crate) fn tracked_record(workspace: &Path) -> Option<PathBuf>`
+`pub(crate) fn tracked_record(workspace: &Path, destination: &Path) -> Option<PathBuf>`
+
+`const TRACKED_EXTENSION: &str = "tracked"`
+
+`fn remove_tracked_records(workspace: &Path)`
 
 `fn lock_soon(lock: &File) -> std::io::Result<bool>`
 

@@ -3707,7 +3707,7 @@ async fn execute_job_with_matrix(
                 image_ahead,
                 crate::job_memory::metered(
                     job_session::with_job_session(job, runtime, mapped, Box::pin(execute_job(ctx))),
-                    measured_to_its_end,
+                    measured_to_its_end(job.steps.len()),
                 ),
             ))
             .await;
@@ -4198,7 +4198,7 @@ async fn execute_matrix_combinations(
                                 &ctx.services,
                             ),
                         ),
-                        measured_to_its_end,
+                        measured_to_its_end(ctx.job_template.steps.len()),
                     )
                     .await
                 }
@@ -4675,11 +4675,11 @@ impl JobServices<'_> {
 }
 
 /// Whether a job's measured memory says what it needs: it passed, or it
-/// failed with every step after the first failure still run, as when only
-/// its last step, such as a coverage upload, failed. A job stopped part way
-/// may not have reached its heaviest step. Keeping only passes left
-/// sindresorhus/execa's legs, all failing at their last step, unmeasured on
-/// every run, so they ran one at a time.
+/// failed only at its last step, as when only a coverage upload at the end
+/// failed. A job stopped part way may not have reached its heaviest step.
+/// Keeping only passes left sindresorhus/execa's legs, all failing at their
+/// last step, unmeasured on every run, so they ran one at a time.
+/// `step_count` is the number of steps the job declares.
 ///
 /// A last step that failed early, such as a `cargo test` that didn't
 /// compile, measures less than the step needs. That is kept anyway: the
@@ -4687,28 +4687,32 @@ impl JobServices<'_> {
 /// highest seen, so the short run lowers nothing a whole one measured, and
 /// only a job never measured whole can start with too little. If it then
 /// runs out of memory, the kill forgets it and it runs alone again.
-fn measured_to_its_end(result: &Result<JobResult, ExecutionError>) -> bool {
-    result.as_ref().is_ok_and(|job| {
-        job.repeated_from.is_none()
-            && match job.status {
-                JobStatus::Success => true,
-                JobStatus::Failure => ran_every_step(&job.steps),
-                JobStatus::Skipped => false,
-            }
-    })
+fn measured_to_its_end(
+    step_count: usize,
+) -> impl FnOnce(&Result<JobResult, ExecutionError>) -> bool {
+    move |result| {
+        result.as_ref().is_ok_and(|job| {
+            job.repeated_from.is_none()
+                && match job.status {
+                    JobStatus::Success => true,
+                    JobStatus::Failure => failed_at_its_last_step(&job.steps, step_count),
+                    JobStatus::Skipped => false,
+                }
+        })
+    }
 }
 
-/// Whether no step was skipped after the first that failed.
-fn ran_every_step(steps: &[StepResult]) -> bool {
-    match steps
+/// Whether the first step of `steps` to fail, by its conclusion, is the
+/// last of the job's `step_count` steps, or a post after them. The step
+/// loop stops at a failure and records nothing for the steps it didn't
+/// reach, so a failure any earlier means the job stopped part way. A step
+/// whose failure `continue-on-error` allowed concludes as a success, and
+/// the job went on past it.
+fn failed_at_its_last_step(steps: &[StepResult], step_count: usize) -> bool {
+    steps
         .iter()
-        .position(|step| step.status == StepStatus::Failure)
-    {
-        Some(first) => steps[first..]
-            .iter()
-            .all(|step| step.status != StepStatus::Skipped),
-        None => false,
-    }
+        .position(|step| step.conclusion == StepStatus::Failure)
+        .is_some_and(|first| step_count > 0 && first + 1 >= step_count)
 }
 
 /// The id a job's memory measurements are kept under.
@@ -18828,38 +18832,34 @@ runs:
         let step = |status| StepResult::new("s".to_string(), status, String::new());
         use StepStatus::{Failure, Skipped, Success};
         // execa: tests passed, the coverage upload at the end failed.
-        assert!(ran_every_step(&[
-            step(Success),
-            step(Success),
-            step(Failure)
-        ]));
+        assert!(failed_at_its_last_step(
+            &[step(Success), step(Success), step(Failure)],
+            3
+        ));
         // A step skipped by its own `if:` before the failure is no matter.
-        assert!(ran_every_step(&[
-            step(Skipped),
-            step(Failure),
-            step(Success)
-        ]));
-        // Stopped part way: the steps after the failure didn't run.
-        assert!(!ran_every_step(&[
-            step(Failure),
-            step(Skipped),
-            step(Skipped)
-        ]));
-        // An `if: always()` step after the failure ran; one skipped by its
-        // own `if:` after it can't be told from one the failure stopped.
-        assert!(ran_every_step(&[
-            step(Failure),
-            step(Success),
-            step(Success)
-        ]));
-        assert!(!ran_every_step(&[
-            step(Failure),
-            step(Success),
-            step(Skipped)
-        ]));
-        // Nothing failed, so nothing to say for a failed job.
-        assert!(!ran_every_step(&[step(Success)]));
-        assert!(!ran_every_step(&[]));
+        assert!(failed_at_its_last_step(
+            &[step(Skipped), step(Success), step(Failure)],
+            3
+        ));
+        // Stopped part way: the loop records nothing after the failure, so
+        // the job's own step count is what tells.
+        assert!(!failed_at_its_last_step(&[step(Success), step(Failure)], 4));
+        // A post that failed after every step ran.
+        assert!(failed_at_its_last_step(
+            &[step(Success), step(Success), step(Failure)],
+            2
+        ));
+        // A failure `continue-on-error` allowed concludes as a success.
+        let mut allowed = step(Failure);
+        allowed.conclusion = Success;
+        assert!(failed_at_its_last_step(
+            &[allowed, step(Success), step(Failure)],
+            3
+        ));
+        // Nothing failed, so nothing to say for a failed job, as when its
+        // setup failed or it called a reusable workflow.
+        assert!(!failed_at_its_last_step(&[step(Success)], 1));
+        assert!(!failed_at_its_last_step(&[], 0));
     }
 
     // --- Composite step if-condition tests ---

@@ -17,9 +17,9 @@
 //! `rustc` or `ld` the kernel picked, and a shell does as `Killed`.
 //!
 //! Only a job that ran to its end records a peak: one that passed, or
-//! failed with every step after the failure still run, as when only a
-//! coverage upload at the end failed. One stopped or cancelled part way
-//! used less than a whole run does. A job
+//! failed only at its last step, as when only a coverage upload at the end
+//! failed. One stopped or cancelled part way used less than a whole run
+//! does. A job
 //! whose containers couldn't all be measured, as with Podman, forgets what
 //! an earlier run measured, which no longer says what it needs.
 //!

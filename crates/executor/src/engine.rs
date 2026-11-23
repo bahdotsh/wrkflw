@@ -4681,6 +4681,13 @@ impl JobServices<'_> {
 /// may not have reached its heaviest step. Keeping only passes left
 /// sindresorhus/execa's legs, all failing at their last step, unmeasured on
 /// every run, so they ran one at a time.
+///
+/// A last step that failed early, such as a `cargo test` that didn't
+/// compile, measures less than the step needs. That is kept anyway: the
+/// reservation is the highest of the recent peaks, never lower than the
+/// highest seen, so the short run lowers nothing a whole one measured, and
+/// only a job never measured whole can start with too little. If it then
+/// runs out of memory, the kill forgets it and it runs alone again.
 fn measured_to_its_end(result: &Result<JobResult, ExecutionError>) -> bool {
     result.as_ref().is_ok_and(|job| {
         job.repeated_from.is_none()

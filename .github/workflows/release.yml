@@ -127,16 +127,23 @@ jobs:
           ref="${IMAGE#ghcr.io/}"
           name="${ref%%:*}"
           tag="${ref##*:}"
-          # Only a refusal says the package is private. Anything else, such
-          # as a network error or a 5xx left after curl's retries, says
+          # Only a refusal says the package is private, and it comes from
+          # either request: GHCR refuses an anonymous token for a private
+          # package (403) before the manifest is asked for. Anything else,
+          # such as a network error or a 5xx left after curl's retries, says
           # nothing about it, and asks for a rerun.
-          status=000
-          if token=$(curl -fsS --retry 3 --retry-connrefused \
-              "https://ghcr.io/token?scope=repository:${name}:pull" | jq -er .token); then
-            status=$(curl -sS --retry 3 --retry-connrefused -o /dev/null -w '%{http_code}' \
-              -H "Authorization: Bearer ${token}" \
-              -H "Accept: application/vnd.oci.image.index.v1+json" \
-              "https://ghcr.io/v2/${name}/manifests/${tag}") || status=000
+          body=$(mktemp)
+          status=$(curl -sS --retry 3 --retry-connrefused -o "$body" -w '%{http_code}' \
+            "https://ghcr.io/token?scope=repository:${name}:pull") || status=000
+          if [ "$status" = 200 ]; then
+            if token=$(jq -er .token "$body"); then
+              status=$(curl -sS --retry 3 --retry-connrefused -o /dev/null -w '%{http_code}' \
+                -H "Authorization: Bearer ${token}" \
+                -H "Accept: application/vnd.oci.image.index.v1+json" \
+                "https://ghcr.io/v2/${name}/manifests/${tag}") || status=000
+            else
+              status=000
+            fi
           fi
           case "$status" in
             200) exit 0 ;;

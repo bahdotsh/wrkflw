@@ -5507,7 +5507,26 @@ fn checkout_destination(ctx: &StepExecutionContext<'_>) -> Result<PathBuf, Strin
             "actions/checkout: path '{path}' is not under the workspace"
         ));
     }
-    Ok(ctx.working_dir.join(relative))
+    let destination = ctx.working_dir.join(relative);
+    // A link already in the workspace may lead out of it: what exists of
+    // the path is checked where it really is.
+    if let Ok(root) = ctx.working_dir.canonicalize() {
+        let existing = destination
+            .ancestors()
+            .find(|part| part.symlink_metadata().is_ok());
+        let inside = existing
+            .map(|part| {
+                part.canonicalize()
+                    .is_ok_and(|real| real.starts_with(&root))
+            })
+            .unwrap_or(true);
+        if !inside {
+            return Err(format!(
+                "actions/checkout: path '{path}' leads out of the workspace through a link"
+            ));
+        }
+    }
+    Ok(destination)
 }
 
 /// Make a path under `workspace` relative, since steps see the workspace under
@@ -15864,6 +15883,53 @@ runs:
         );
         assert!(destination(&[("path", "../outside")]).is_err());
         assert!(destination(&[("path", "/elsewhere")]).is_err());
+    }
+
+    /// A link in the workspace to a directory outside it is no way out.
+    #[cfg(unix)]
+    #[test]
+    fn checkout_path_through_a_link_out_of_the_workspace_is_refused() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("out")).unwrap();
+        fs::create_dir(workspace.path().join("in")).unwrap();
+        let job_env = HashMap::from([(
+            "GITHUB_WORKSPACE".to_string(),
+            workspace.path().to_string_lossy().to_string(),
+        )]);
+        let working_dir = workspace.path().to_path_buf();
+        let destination = |path: &str| {
+            let with = HashMap::from([("path".to_string(), path.to_string())]);
+            let step = make_step_uses("actions/checkout@v4", Some(with));
+            let ctx = StepExecutionContext {
+                step: &step,
+                step_idx: 0,
+                job_env: &job_env,
+                job_user_env: &job_env,
+                working_dir: &working_dir,
+                runtime: &runtime,
+                workflow: &workflow,
+                runner_image: "ubuntu:latest",
+                installed_runtimes: &BuiltRuntimes::default(),
+                verbose: false,
+                matrix_combination: &None,
+                container_config: None,
+                workflow_defaults: None,
+                job_defaults: None,
+                step_outputs: &HashMap::new(),
+                step_statuses: &HashMap::new(),
+                job_status: "success",
+                services: test_services(),
+                pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+            };
+            checkout_destination(&ctx)
+        };
+        assert!(destination("out/repo").is_err());
+        assert!(destination("out").is_err());
+        assert_eq!(destination("in/repo"), Ok(working_dir.join("in/repo")));
+        assert_eq!(destination("new/repo"), Ok(working_dir.join("new/repo")));
     }
 
     #[tokio::test]

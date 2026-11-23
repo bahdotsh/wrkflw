@@ -12,7 +12,6 @@ use thiserror::Error;
 
 use crate::acceleration;
 use crate::action_resolver::{self, is_git_sha};
-use crate::checkout_sync::copy_directory_contents;
 use crate::dependency;
 use crate::docker;
 use crate::environment;
@@ -5484,20 +5483,7 @@ fn workspace_relative_input(path: &str, job_env: &HashMap<String, String>) -> St
 /// `repository:` naming another one keeps the workspace, as before. A path
 /// outside the workspace is refused, as actions/checkout refuses it.
 fn checkout_destination(ctx: &StepExecutionContext<'_>) -> Result<PathBuf, String> {
-    let with = ctx.step.with.as_ref();
-    let input = |key: &str| {
-        with.and_then(|w| w.get(key))
-            .map(|value| preprocess_with_value(value, ctx).trim().to_string())
-            .filter(|value| !value.is_empty())
-    };
-    let own_repository = match input("repository") {
-        None => true,
-        Some(repository) => ctx
-            .job_env
-            .get("GITHUB_REPOSITORY")
-            .is_some_and(|own| own.eq_ignore_ascii_case(&repository)),
-    };
-    let Some(path) = input("path").filter(|_| own_repository) else {
+    let Some(path) = checkout_input(ctx, "path").filter(|_| checks_out_own_repository(ctx)) else {
         return Ok(ctx.working_dir.to_path_buf());
     };
     let relative = workspace_relative_input(&path, ctx.job_env);
@@ -5534,6 +5520,46 @@ fn checkout_destination(ctx: &StepExecutionContext<'_>) -> Result<PathBuf, Strin
         }
     }
     Ok(destination)
+}
+
+/// The `actions/checkout` input `key` as the step gives it, or `None` when
+/// it is missing or empty.
+fn checkout_input(ctx: &StepExecutionContext<'_>, key: &str) -> Option<String> {
+    ctx.step
+        .with
+        .as_ref()
+        .and_then(|with| with.get(key))
+        .map(|value| preprocess_with_value(value, ctx).trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Whether the checkout is of the run's own repository, the only one
+/// wrkflw copies: no `repository:`, or one naming it.
+fn checks_out_own_repository(ctx: &StepExecutionContext<'_>) -> bool {
+    match checkout_input(ctx, "repository") {
+        None => true,
+        Some(repository) => ctx
+            .job_env
+            .get("GITHUB_REPOSITORY")
+            .is_some_and(|own| own.eq_ignore_ascii_case(&repository)),
+    }
+}
+
+/// What to say when a checkout into its own directory asks for a `ref:`,
+/// as `ref: gh-pages` with `path: gh-pages` does: wrkflw copies the working
+/// tree, whatever the ref, so that directory holds this branch's files.
+/// Not said for a checkout into the workspace, whose `ref:` is most often
+/// the commit being run, such as a pull request's head.
+fn checkout_ref_not_honoured(ctx: &StepExecutionContext<'_>) -> Option<String> {
+    if !checks_out_own_repository(ctx) {
+        return None;
+    }
+    let path = checkout_input(ctx, "path")?;
+    let git_ref = checkout_input(ctx, "ref")?;
+    Some(format!(
+        "actions/checkout: ref '{git_ref}' is not checked out locally: '{path}' gets the \
+         working tree wrkflw runs from, as the workspace does"
+    ))
 }
 
 /// Make a path under `workspace` relative, since steps see the workspace under
@@ -6014,7 +6040,11 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     e
                 ))
             })?;
-            copy_directory_contents(&current_dir, &destination)?;
+            crate::checkout_sync::checkout_into(&current_dir, ctx.working_dir, &destination)?;
+            let ref_note = checkout_ref_not_honoured(&ctx);
+            if let Some(note) = &ref_note {
+                wrkflw_logging::warning(note);
+            }
 
             // Add info for logs
             let output = if ctx.verbose {
@@ -6038,6 +6068,10 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 detailed_output
             } else {
                 "Emulated checkout: Copied current directory to workspace".to_string()
+            };
+            let output = match ref_note {
+                Some(note) => format!("{output}\n{note}\n"),
+                None => output,
             };
 
             if ctx.verbose {
@@ -6774,7 +6808,12 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 ctx.workflow_defaults
                     .and_then(|d| d.run.as_ref()?.working_directory.as_deref())
             })
-            .map(|wd| resolve_working_directory(wd, &ctx, &step_env, &step_user_env))
+            .map(|wd| {
+                // `${{ github.action_path }}` names the action's directory
+                // as the container sees it, as in the step's `run:`.
+                let lookup = container_lookup.as_ref().unwrap_or(&step_env);
+                resolve_working_directory(wd, &ctx, lookup, &step_user_env)
+            })
             .transpose();
         let effective_wd = match effective_wd {
             Ok(wd) => wd,
@@ -6797,7 +6836,13 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     c => normalized.push(c.as_os_str()),
                 }
             }
-            if !normalized.starts_with(container_workspace) {
+            // A composite action's step may work in the action's own
+            // directory, `${{ github.action_path }}`, as on GitHub: in a
+            // container it is mounted at its own place, outside the
+            // workspace.
+            let in_action_dir = container_lookup.is_some()
+                && normalized.starts_with(crate::job_session::CONTAINER_ACTION_DIR);
+            if !normalized.starts_with(container_workspace) && !in_action_dir {
                 return Ok(StepResult::new(
                     step_name,
                     StepStatus::Failure,
@@ -8019,9 +8064,16 @@ async fn execute_composite_action(
                     pending_cache_saves,
                 };
 
+                // In a container, `${{ github.action_path }}` is where the
+                // container sees the action, here as in the step's `run:`.
+                let seen = as_the_container_sees_it(step_ctx.job_env);
                 let should_run = match &composite_step.if_condition {
                     Some(cond) => {
-                        evaluate_step_condition(cond, working_dir, &step_ctx.expr_context())
+                        let cond_ctx = match &seen {
+                            Some(env) => step_ctx.expr_context_with_env(env, step_ctx.job_user_env),
+                            None => step_ctx.expr_context(),
+                        };
+                        evaluate_step_condition(cond, working_dir, &cond_ctx)
                     }
                     None => true,
                 };
@@ -15833,46 +15885,57 @@ runs:
         assert!(result.output.contains("Invalid working-directory"));
     }
 
+    /// Calls `f` with the context of an `actions/checkout` step given
+    /// `with`, in a job whose env is `job_env` and workspace `working_dir`.
+    fn with_checkout_ctx<T>(
+        job_env: &HashMap<String, String>,
+        working_dir: &Path,
+        with: &[(&str, &str)],
+        f: impl FnOnce(&StepExecutionContext<'_>) -> T,
+    ) -> T {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let with = with
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect::<HashMap<_, _>>();
+        let step = make_step_uses("actions/checkout@v4", Some(with));
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env,
+            job_user_env: job_env,
+            working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services: test_services(),
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+        };
+        f(&ctx)
+    }
+
     /// go-chi/chi checks itself out at `${{ env.GOPATH }}/src/github.com/
     /// ${{ github.repository }}`, with GOPATH the workspace, and runs its
     /// tests there: the checkout went to the workspace's root instead.
     #[test]
     fn checkout_goes_where_its_path_says_inside_the_workspace() {
-        let runtime = MockContainerRuntime::default();
-        let workflow = minimal_workflow();
         let job_env = HashMap::from([
             ("GITHUB_WORKSPACE".to_string(), "/host/repo".to_string()),
             ("GITHUB_REPOSITORY".to_string(), "go-chi/chi".to_string()),
         ]);
         let working_dir = PathBuf::from("/host/repo");
         let destination = |with: &[(&str, &str)]| {
-            let with = with
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect::<HashMap<_, _>>();
-            let step = make_step_uses("actions/checkout@v4", Some(with));
-            let ctx = StepExecutionContext {
-                step: &step,
-                step_idx: 0,
-                job_env: &job_env,
-                job_user_env: &job_env,
-                working_dir: &working_dir,
-                runtime: &runtime,
-                workflow: &workflow,
-                runner_image: "ubuntu:latest",
-                installed_runtimes: &BuiltRuntimes::default(),
-                verbose: false,
-                matrix_combination: &None,
-                container_config: None,
-                workflow_defaults: None,
-                job_defaults: None,
-                step_outputs: &HashMap::new(),
-                step_statuses: &HashMap::new(),
-                job_status: "success",
-                services: test_services(),
-                pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
-            };
-            checkout_destination(&ctx)
+            with_checkout_ctx(&job_env, &working_dir, with, checkout_destination)
         };
         assert_eq!(destination(&[]), Ok(working_dir.clone()));
         assert_eq!(
@@ -15892,12 +15955,37 @@ runs:
         assert!(destination(&[("path", "/elsewhere")]).is_err());
     }
 
+    /// `ref: gh-pages` with `path: gh-pages` gets this branch's files, and
+    /// says so; a `ref:` for the workspace, most often the commit being
+    /// run, says nothing.
+    #[test]
+    fn a_checkout_ref_into_its_own_directory_is_said_to_be_ignored() {
+        let job_env = HashMap::from([
+            ("GITHUB_WORKSPACE".to_string(), "/host/repo".to_string()),
+            ("GITHUB_REPOSITORY".to_string(), "o/r".to_string()),
+        ]);
+        let working_dir = PathBuf::from("/host/repo");
+        let note = |with: &[(&str, &str)]| {
+            with_checkout_ctx(&job_env, &working_dir, with, checkout_ref_not_honoured)
+        };
+        let said = note(&[("ref", "gh-pages"), ("path", "gh-pages")]).unwrap();
+        assert!(
+            said.contains("'gh-pages'") && said.contains("not checked out"),
+            "{said}"
+        );
+        assert_eq!(note(&[("ref", "${{ github.sha }}")]), None);
+        assert_eq!(note(&[("path", "sub")]), None);
+        // Another repository's checkout isn't made at all.
+        assert_eq!(
+            note(&[("repository", "x/y"), ("ref", "v1"), ("path", "y")]),
+            None
+        );
+    }
+
     /// A link in the workspace to a directory outside it is no way out.
     #[cfg(unix)]
     #[test]
     fn checkout_path_through_a_link_out_of_the_workspace_is_refused() {
-        let runtime = MockContainerRuntime::default();
-        let workflow = minimal_workflow();
         let workspace = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), workspace.path().join("out")).unwrap();
@@ -15908,30 +15996,12 @@ runs:
         )]);
         let working_dir = workspace.path().to_path_buf();
         let destination = |path: &str| {
-            let with = HashMap::from([("path".to_string(), path.to_string())]);
-            let step = make_step_uses("actions/checkout@v4", Some(with));
-            let ctx = StepExecutionContext {
-                step: &step,
-                step_idx: 0,
-                job_env: &job_env,
-                job_user_env: &job_env,
-                working_dir: &working_dir,
-                runtime: &runtime,
-                workflow: &workflow,
-                runner_image: "ubuntu:latest",
-                installed_runtimes: &BuiltRuntimes::default(),
-                verbose: false,
-                matrix_combination: &None,
-                container_config: None,
-                workflow_defaults: None,
-                job_defaults: None,
-                step_outputs: &HashMap::new(),
-                step_statuses: &HashMap::new(),
-                job_status: "success",
-                services: test_services(),
-                pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
-            };
-            checkout_destination(&ctx)
+            with_checkout_ctx(
+                &job_env,
+                &working_dir,
+                &[("path", path)],
+                checkout_destination,
+            )
         };
         assert!(destination("out/repo").is_err());
         assert!(destination("out").is_err());
@@ -18697,6 +18767,8 @@ runs:
   steps:
     - run: ${{ github.action_path }}/entrypoint.sh "$CONFIG"
       shell: bash
+      if: startsWith(github.action_path, '/github/action')
+      working-directory: ${{ github.action_path }}
       env:
         CONFIG: ${{ github.action_path }}/config.toml
 "#,
@@ -18740,6 +18812,8 @@ runs:
         );
         let host = action_dir.path().canonicalize().unwrap();
         assert!(!command.contains(&*host.to_string_lossy()), "{command}");
+        // Its `if:` saw that path, and its `working-directory:` is there.
+        assert_eq!(calls[0].working_dir, Path::new("/github/action"));
         // The step's `env:` reaches the container too.
         let config = calls[0]
             .env_vars

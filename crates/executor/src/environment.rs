@@ -103,19 +103,20 @@ pub fn apply_github_container_context(env: &mut HashMap<String, String>) {
 pub const IMAGE_OS: &str = "ubuntu24";
 
 /// `ImageOS` for a job that `runs-on` the label the built-in image table
-/// sees: `ubuntu22` for `ubuntu-22.04`, as that runs in Ubuntu 22.04, and
-/// so on. Every other label runs in `ubuntu:latest` and gets
-/// `ubuntu-latest`'s.
-pub fn image_os(runs_on: &str) -> &'static str {
-    let release = runs_on
+/// sees: `ubuntuNN` for `ubuntu-NN.04` and its sized variants, as GitHub
+/// names each release's runner, so `ubuntu-22.04` is `ubuntu22` and a
+/// release newer than this table knows is named the same way. Every other
+/// label, `ubuntu-latest` included, gets `ubuntu-latest`'s.
+pub fn image_os(runs_on: &str) -> String {
+    let major = runs_on
         .trim()
         .strip_prefix("ubuntu-")
-        .and_then(|rest| rest.split('-').next());
-    match release {
-        Some("22.04") => "ubuntu22",
-        Some("20.04") => "ubuntu20",
-        Some("18.04") => "ubuntu18",
-        _ => IMAGE_OS,
+        .and_then(|rest| rest.split('-').next())
+        .and_then(|release| release.strip_suffix(".04"))
+        .filter(|major| !major.is_empty() && major.bytes().all(|b| b.is_ascii_digit()));
+    match major {
+        Some(major) => format!("ubuntu{major}"),
+        None => IMAGE_OS.to_string(),
     }
 }
 
@@ -135,7 +136,7 @@ pub fn set_image_os(
         .as_ref()
         .and_then(|labels| labels.first())
         .map_or("ubuntu-latest", String::as_str);
-    env.insert("ImageOS".to_string(), image_os(label).to_string());
+    env.insert("ImageOS".to_string(), image_os(label));
 }
 
 /// Replace host paths with what a GitLab job sees inside a container. GitLab
@@ -677,6 +678,12 @@ mod tests {
         assert_eq!(image_os("ubuntu-24.04"), "ubuntu24");
         assert_eq!(image_os("ubuntu-22.04"), "ubuntu22");
         assert_eq!(image_os("ubuntu-20.04-medium"), "ubuntu20");
+        // A release newer than any listed here is named as GitHub names it.
+        assert_eq!(image_os("ubuntu-26.04"), "ubuntu26");
+        assert_eq!(image_os("ubuntu-26.04-arm"), "ubuntu26");
+        // Not a release: `ubuntu-latest`'s.
+        assert_eq!(image_os("ubuntu-24.10"), "ubuntu24");
+        assert_eq!(image_os("ubuntu-.04"), "ubuntu24");
         // Runs in ubuntu:latest, as a matrix's `${{ matrix.os }}` does.
         assert_eq!(image_os("macos-latest"), "ubuntu24");
         assert_eq!(image_os("${{ matrix.os }}"), "ubuntu24");

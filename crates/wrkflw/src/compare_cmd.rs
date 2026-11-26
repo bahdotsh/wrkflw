@@ -141,9 +141,11 @@ fn expected_jobs(path: &Path) -> Result<Vec<ExpectedJob>, String> {
         let job = &workflow.jobs[id];
         let called = job.uses.is_some();
         let runs_docker = wrkflw_executor::script_commands::steps_run(&job.steps, &["docker"]);
+        // GitHub trims a name: a folded `name: >` ends in a newline, and a
+        // leg missing a value the name reads leaves a trailing space.
         let template = raw["jobs"][id.as_str()]["name"]
             .as_str()
-            .map(str::to_string);
+            .map(|name| name.trim().to_string());
         let legs = job
             .matrix_config()
             .and_then(|config| wrkflw_matrix::expand_matrix(config).ok());
@@ -167,8 +169,9 @@ fn expected_jobs(path: &Path) -> Result<Vec<ExpectedJob>, String> {
             let named = template
                 .as_deref()
                 .and_then(|t| {
-                    wrkflw_executor::expression::evaluate_matrix_text(t, Some(&leg.values))
+                    wrkflw_executor::expression::evaluate_matrix_name(t, Some(&leg.values))
                 })
+                .map(|name| name.trim().to_string())
                 .unwrap_or_else(|| id.clone());
             let values: Option<Vec<String>> =
                 leg.values.values().map(value_text).collect::<Option<_>>();
@@ -194,6 +197,71 @@ fn expected_jobs(path: &Path) -> Result<Vec<ExpectedJob>, String> {
         }
     }
     Ok(expected)
+}
+
+/// `expected` with each job whose matrix is only known once the run has
+/// it, such as `${{ fromJSON(needs.list.outputs.matrix) }}`, replaced by
+/// the legs the local run reported for it. GitHub names those legs by their
+/// values in the matrix's own key order, `test (ubuntu-latest, 1.27, 9.7)`,
+/// and wrkflw by `key: value` in key order, so a leg pairs by its values in
+/// any order (go-sql-driver/mysql).
+fn with_run_time_legs(expected: Vec<ExpectedJob>, local: &[Value]) -> Vec<ExpectedJob> {
+    let known: std::collections::HashSet<String> =
+        expected.iter().map(|job| job.local.clone()).collect();
+    let mut out = Vec::with_capacity(expected.len());
+    for job in expected {
+        let legs: Vec<(String, Vec<String>)> = if job.matrix_values.is_none()
+            && job.github.as_deref() == Some(job.github_base.as_str())
+        {
+            local
+                .iter()
+                .filter_map(|l| l["name"].as_str())
+                .filter(|name| !known.contains(*name))
+                .filter_map(|name| Some((name.to_string(), leg_values(&job.local, name)?)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if legs.is_empty() {
+            out.push(job);
+            continue;
+        }
+        for (local, values) in legs {
+            out.push(ExpectedJob {
+                local,
+                github: None,
+                github_base: job.github_base.clone(),
+                matrix_values: Some(values),
+                called: job.called,
+                runs_docker: job.runs_docker,
+            });
+        }
+    }
+    out
+}
+
+/// The values of the leg wrkflw names `id (key: value, key: value)`. A
+/// value holding `, ` stays whole: a piece without `: ` continues the one
+/// before it.
+fn leg_values(id: &str, name: &str) -> Option<Vec<String>> {
+    let inner = name
+        .strip_prefix(id)?
+        .strip_prefix(" (")?
+        .strip_suffix(')')?;
+    let mut pairs: Vec<String> = Vec::new();
+    for piece in inner.split(", ") {
+        match pairs.last_mut() {
+            Some(last) if !piece.contains(": ") => {
+                last.push_str(", ");
+                last.push_str(piece);
+            }
+            _ => pairs.push(piece.to_string()),
+        }
+    }
+    pairs
+        .iter()
+        .map(|pair| pair.split_once(": ").map(|(_, value)| value.to_string()))
+        .collect()
 }
 
 /// One row of the comparison.
@@ -260,7 +328,15 @@ const NO_DOCKER_ENGINE: &[&str] = &[
 /// 401 is left out, as a registry or upload service gives one for its own
 /// credentials, and so is a mention of `gh auth login`, which setup scripts
 /// and help text print too.
-const NO_GITHUB_TOKEN: &[&str] = &["set the GH_TOKEN environment variable", "Bad credentials"];
+const NO_GITHUB_TOKEN: &[&str] = &[
+    "set the GH_TOKEN environment variable",
+    "Bad credentials",
+    // `github-token`, which actions such as actions/github-script default
+    // to the job's token, refused as empty by `@actions/core`. Not a bare
+    // `token`: actions take a third party's token under that name too,
+    // from a secret the job's token would not stand in for.
+    "Input required and not supplied: github-token",
+];
 
 /// Whether a failed step's output shows it had no GitHub token.
 fn lacked_github_token(failure: &Value) -> bool {
@@ -290,6 +366,50 @@ fn failure_lines(failure: &Value) -> impl Iterator<Item = &str> {
 fn lacked_docker(failure: &Value) -> bool {
     failure_lines(failure).any(|line| NO_DOCKER_ENGINE.iter().any(|sign| line.contains(sign)))
 }
+
+/// What a coverage service prints when it refuses an upload for want of
+/// what only a GitHub job has: Codecov without the repository's token on a
+/// protected branch (urfave/cli), Coveralls without the job's GitHub token
+/// and run (go-sql-driver/mysql).
+const NO_SERVICE_TOKEN: &[&str] = &[
+    "Token required because branch is protected",
+    "Couldn't find a repository matching this job",
+];
+
+/// Whether a failed step's output shows a service refused it for want of
+/// a token from the repository's secrets.
+fn lacked_service_token(failure: &Value) -> bool {
+    failure_lines(failure).any(|line| NO_SERVICE_TOKEN.iter().any(|sign| line.contains(sign)))
+}
+
+/// What a step prints when it runs an x86_64 program, as `cross` does, in
+/// an arm64 job container on an Apple Silicon Mac. Only Rosetta prints it,
+/// so it says so on any build of wrkflw.
+const ROSETTA_NEEDS_X86_64: &str =
+    "rosetta error: failed to open elf at /lib64/ld-linux-x86-64.so.2";
+
+/// What `cross` prints when it can't add the x86_64 toolchain it needs. On
+/// an x86_64 machine the same line has a cause of its own, such as a
+/// download that failed, so it counts only where [`HOST_IS_ARM64`].
+const RUSTUP_NEEDS_X86_64: &str = "toolchain add stable-x86_64-unknown-linux-gnu";
+
+/// Whether job containers here are arm64, judged by the architecture wrkflw
+/// was built for. An approximation: the run's report doesn't record the
+/// container's, and an x86_64 build under Rosetta, a remote Docker host or
+/// a cluster may differ. It decides only whether a note is added.
+const HOST_IS_ARM64: bool = cfg!(target_arch = "aarch64");
+
+/// Whether a failed step's output shows it needed an x86_64 machine, on a
+/// machine whose job containers are arm64 when `host_is_arm64`.
+fn needed_x86_64(failure: &Value, host_is_arm64: bool) -> bool {
+    failure_lines(failure).any(|line| {
+        line.contains(ROSETTA_NEEDS_X86_64) || (host_is_arm64 && line.contains(RUSTUP_NEEDS_X86_64))
+    })
+}
+
+/// The note added when a step needed an x86_64 machine.
+const NEEDS_X86_64_NOTE: &str = "a step ran an x86_64 program, as `cross` does, which this \
+     machine's arm64 job container can't run; GitHub's runner is x86_64";
 
 /// The most a note quotes of a line of a step's output.
 const QUOTED_LINE_CHARS: usize = 200;
@@ -374,6 +494,20 @@ fn note_for(local: &Value, failures: &[Value], runs_docker: bool) -> Option<Stri
              job gets yours with WRKFLW_JOB_GITHUB_TOKEN=1"
                 .to_string(),
         );
+    }
+    if local["status"] == "failure" && failures_of(failures, name).any(lacked_service_token) {
+        notes.push(
+            "a coverage service refused the upload: it takes it from a GitHub job, by the \
+             job's token or one the repository keeps in its secrets, such as CODECOV_TOKEN"
+                .to_string(),
+        );
+    }
+    // GitHub's `ubuntu-*` runners are x86_64; a job container on an arm64
+    // machine is arm64, and `cross` and its images are x86_64 only.
+    if local["status"] == "failure"
+        && failures_of(failures, name).any(|failure| needed_x86_64(failure, HOST_IS_ARM64))
+    {
+        notes.push(NEEDS_X86_64_NOTE.to_string());
     }
     for action in local["actions_not_run"].as_array().into_iter().flatten() {
         notes.push(format!(
@@ -1146,6 +1280,7 @@ pub(crate) async fn run(ctx: CompareCtx) -> ! {
         .as_array()
         .cloned()
         .unwrap_or_default();
+    let expected = with_run_time_legs(expected, &local_jobs);
     let rows = rows(&expected, &remote.jobs, &local_jobs, &failures);
     let mut report = report(&remote, &local, &rows);
     if let Some(note) = ref_unsure {
@@ -2159,6 +2294,8 @@ mod tests {
         for line in [
             "gh: To use GitHub CLI in a GitHub Actions workflow, set the GH_TOKEN environment variable. Example:",
             "HTTP 401: Bad credentials (https://api.github.com/repos/x/y/attestations)",
+            // actions/github-script's `github-token`, inside codecov-action.
+            "Error: Input required and not supplied: github-token",
         ] {
             let note = note_after(line);
             assert!(note.contains("WRKFLW_JOB_GITHUB_TOKEN=1"), "{note}");
@@ -2167,9 +2304,161 @@ mod tests {
             "error: attestation does not match",
             "npm error code E401: HTTP 401 Unauthorized",
             "setup: if this fails, run gh auth login first",
+            // A third party's token from a secret the run doesn't have.
+            "Error: Input required and not supplied: token",
         ] {
             let note = note_after(own);
             assert!(!note.contains("WRKFLW_JOB_GITHUB_TOKEN"), "{note}");
         }
+    }
+
+    #[test]
+    fn an_upload_refused_for_want_of_a_secret_token_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: CI\non: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: codecov/codecov-action@v5\n";
+        let expected = expected_jobs(&write(dir.path(), yaml)).unwrap();
+        let github = vec![remote("test", "success")];
+        let local = vec![json!({"name": "test", "status": "failure"})];
+        let failures = [
+            json!({"job": "test", "step": "Composite Action", "exit_code": 1,
+            "error_lines": [], "output_tail": [
+                "error - 2026-11-20 16:15:25,702 -- Upload failed: {\"message\":\"Token required because branch is protected\"}"
+            ]}),
+        ];
+        let note = rows(&expected, &github, &local, &failures)[0]
+            .note
+            .clone()
+            .unwrap();
+        assert!(note.contains("CODECOV_TOKEN"), "{note}");
+        let coveralls = [
+            json!({"job": "test", "step": "Send coverage", "exit_code": 1,
+            "error_lines": [], "output_tail": [
+                "{\"message\":\"Couldn't find a repository matching this job.\",\"error\":true}"
+            ]}),
+        ];
+        let note = rows(&expected, &github, &local, &coveralls)[0]
+            .note
+            .clone()
+            .unwrap();
+        assert!(note.contains("coverage service"), "{note}");
+    }
+
+    /// go-sql-driver/mysql's `test` matrix comes from its `list` job's
+    /// output, so its legs are only known from the local run.
+    #[test]
+    fn a_leg_of_a_matrix_made_at_run_time_pairs_by_its_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: CI\non: push\njobs:\n  list:\n    runs-on: ubuntu-latest\n    outputs:\n      matrix: ${{ steps.m.outputs.matrix }}\n    steps:\n      - id: m\n        run: echo hi\n  test:\n    needs: list\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix: ${{ fromJSON(needs.list.outputs.matrix) }}\n    steps:\n      - run: echo hi\n";
+        let expected = expected_jobs(&write(dir.path(), yaml)).unwrap();
+        let local = vec![
+            json!({"name": "list", "status": "success"}),
+            json!({"name": "test (go: 1.27, mysql: 9.7, os: ubuntu-latest)", "status": "success"}),
+            json!({"name": "test (go: 1.27, mysql: mariadb-11.8, os: ubuntu-latest)", "status": "failure"}),
+        ];
+        let expected = with_run_time_legs(expected, &local);
+        let github = vec![
+            remote("list", "success"),
+            remote("test (ubuntu-latest, 1.27, mariadb-11.8)", "failure"),
+            remote("test (ubuntu-latest, 1.27, 9.7)", "success"),
+        ];
+        let rows = rows(&expected, &github, &local, &[]);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(rows.iter().all(|row| row.agree == Some(true)), "{rows:?}");
+        assert_eq!(
+            leg_values("t", "t (features: serde, std, os: linux)"),
+            Some(vec!["serde, std".to_string(), "linux".to_string()])
+        );
+    }
+
+    /// Two run-time legs whose values are the same set in another order
+    /// fit both GitHub names, as the matrix's key order isn't known here:
+    /// the rows say so rather than claim which is which.
+    #[test]
+    fn run_time_legs_that_differ_only_in_order_are_called_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: CI\non: push\njobs:\n  list:\n    runs-on: ubuntu-latest\n    outputs:\n      matrix: ${{ steps.m.outputs.matrix }}\n    steps:\n      - id: m\n        run: echo hi\n  test:\n    needs: list\n    runs-on: ubuntu-latest\n    strategy:\n      matrix: ${{ fromJSON(needs.list.outputs.matrix) }}\n    steps:\n      - run: echo hi\n";
+        let expected = expected_jobs(&write(dir.path(), yaml)).unwrap();
+        let local = vec![
+            json!({"name": "list", "status": "success"}),
+            json!({"name": "test (a: 1, b: 2)", "status": "success"}),
+            json!({"name": "test (a: 2, b: 1)", "status": "failure"}),
+        ];
+        let expected = with_run_time_legs(expected, &local);
+        let github = vec![
+            remote("list", "success"),
+            remote("test (1, 2)", "success"),
+            remote("test (2, 1)", "failure"),
+        ];
+        let rows = rows(&expected, &github, &local, &[]);
+        let legs: Vec<_> = rows
+            .iter()
+            .filter(|row| row.local_name.as_deref() != Some("list"))
+            .collect();
+        assert_eq!(legs.len(), 2, "{rows:?}");
+        for row in legs {
+            let note = row.note.clone().unwrap_or_default();
+            assert_eq!(note, ambiguous_note(row.github_name.as_deref().unwrap(), 2));
+        }
+    }
+
+    /// A job whose step ran an x86_64 program in an arm64 container, as
+    /// `cross` on an Apple Silicon Mac does, says so; a failure of its own
+    /// doesn't.
+    #[test]
+    fn a_failure_for_want_of_an_x86_64_machine_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cross build\n";
+        let expected = expected_jobs(&write(dir.path(), yaml)).unwrap();
+        let github = vec![remote("build", "success")];
+        let local = vec![json!({"name": "build", "status": "failure"})];
+        let note_after = |line: &str| {
+            let failures = [json!({"job": "build", "step": "Build", "exit_code": 1,
+                "error_lines": [], "output_tail": [line]})];
+            rows(&expected, &github, &local, &failures)[0]
+                .note
+                .clone()
+                .unwrap_or_default()
+        };
+        // Rosetta's line says so on any machine.
+        let rosetta = "rosetta error: failed to open elf at /lib64/ld-linux-x86-64.so.2";
+        assert!(needed_x86_64(&json!({"output_tail": [rosetta]}), false));
+        assert!(note_after(rosetta).contains(NEEDS_X86_64_NOTE), "{rosetta}");
+        // The rustup line only where the job container is arm64: on an
+        // x86_64 machine the same line has another cause. The note quotes
+        // the line, which names x86_64 itself, so look for the note's own
+        // words.
+        let rustup = "1: `rustup toolchain add stable-x86_64-unknown-linux-gnu --profile minimal` failed with exit status: 1";
+        let failure = json!({"output_tail": [rustup]});
+        assert!(needed_x86_64(&failure, true));
+        assert!(!needed_x86_64(&failure, false));
+        assert_eq!(
+            note_after(rustup).contains(NEEDS_X86_64_NOTE),
+            HOST_IS_ARM64,
+            "{rustup}"
+        );
+        assert!(!note_after("error[E0308]: mismatched types").contains(NEEDS_X86_64_NOTE));
+        // A bad shebang or a broken binary says this on any machine.
+        assert!(!note_after("./run.sh: exec format error").contains(NEEDS_X86_64_NOTE));
+    }
+
+    /// GitHub trims a job's name: a folded `name: >` ends in a newline,
+    /// and a leg missing a value the name reads leaves a trailing space.
+    #[test]
+    fn a_folded_name_is_trimmed_as_github_trims_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: CI\non: push\njobs:\n  test:\n    name: >\n      Test Python ${{ matrix.python }},\n      Redis ${{ matrix.redis }}\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        python: ['3.13']\n        redis: ['latest']\n        include:\n          - python: '3.10'\n    steps:\n      - run: echo hi\n";
+        let expected = expected_jobs(&write(dir.path(), yaml)).unwrap();
+        assert!(
+            expected
+                .iter()
+                .any(|job| job.matches("Test Python 3.13, Redis latest")),
+            "{expected:?}"
+        );
+        assert!(
+            expected
+                .iter()
+                .any(|job| job.matches("Test Python 3.10, Redis")),
+            "{expected:?}"
+        );
     }
 }

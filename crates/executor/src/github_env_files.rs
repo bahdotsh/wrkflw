@@ -230,9 +230,17 @@ pub fn apply_step_environment_updates(
     };
     applied.env_vars.sort();
 
-    // Store step outputs keyed by step ID for ${{ steps.<id>.outputs.<key> }}
+    // Store step outputs keyed by step ID for ${{ steps.<id>.outputs.<key> }}.
+    // Added to what the step's output already set with the deprecated
+    // `::set-output`, which GitHub still honours, not in place of it: an
+    // empty $GITHUB_OUTPUT used to wipe those, and django-redis's
+    // `echo "::set-output name=dir::$(pip cache dir)"` gave the cache step
+    // no path.
     if let Some(id) = step_id {
-        step_outputs_map.insert(id.to_string(), updates.outputs);
+        step_outputs_map
+            .entry(id.to_string())
+            .or_default()
+            .extend(updates.outputs);
     }
 
     // Merge GITHUB_ENV entries into job_env for subsequent steps.
@@ -816,5 +824,42 @@ mod tests {
         // /opt/tool should appear exactly once (not duplicated)
         let path = job_env.get("PATH").unwrap();
         assert_eq!(path, "/opt/other:/opt/tool:/usr/bin");
+    }
+
+    #[test]
+    fn set_output_values_survive_an_empty_github_output_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_path = dir.path().join("output");
+        let env_path = dir.path().join("env");
+        let path_path = dir.path().join("path");
+        fs::write(&output_path, "").unwrap();
+        fs::write(&env_path, "").unwrap();
+        fs::write(&path_path, "").unwrap();
+        let mut job_env = HashMap::new();
+        for (name, path) in [
+            ("GITHUB_OUTPUT", &output_path),
+            ("GITHUB_ENV", &env_path),
+            ("GITHUB_PATH", &path_path),
+        ] {
+            job_env.insert(name.to_string(), path.to_string_lossy().to_string());
+        }
+        let mut job_user_env = HashMap::new();
+        // What `::set-output name=dir::...` in the step's output recorded.
+        let mut step_outputs_map = HashMap::from([(
+            "pip-cache".to_string(),
+            HashMap::from([("dir".to_string(), "/home/runner/.cache/pip".to_string())]),
+        )]);
+
+        apply_step_environment_updates(
+            &mut job_env,
+            &mut job_user_env,
+            &mut step_outputs_map,
+            Some("pip-cache"),
+        );
+
+        assert_eq!(
+            step_outputs_map["pip-cache"].get("dir").map(String::as_str),
+            Some("/home/runner/.cache/pip")
+        );
     }
 }

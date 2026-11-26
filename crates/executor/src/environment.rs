@@ -89,9 +89,54 @@ pub fn apply_github_container_context(env: &mut HashMap<String, String>) {
         ("RUNNER_OS", "Linux"),
         ("RUNNER_TEMP", &container_runner_temp()),
         ("RUNNER_TOOL_CACHE", "/opt/hostedtoolcache"),
+        // What `ubuntu-latest` sets, until [`set_image_os`] gives each job
+        // its own runner's. Actions that download a build for the runner's
+        // OS release read it: shogo82148/actions-setup-mysql finds no MySQL
+        // without it (go-sql-driver/mysql).
+        ("ImageOS", IMAGE_OS),
     ] {
         env.insert(key.to_string(), value.to_string());
     }
+}
+
+/// `ImageOS` on GitHub's `ubuntu-latest` runner, Ubuntu 24.04.
+pub const IMAGE_OS: &str = "ubuntu24";
+
+/// `ImageOS` for a job that `runs-on` the label the built-in image table
+/// sees: `ubuntuNN` for `ubuntu-NN.04` and its sized variants, as GitHub
+/// names each release's runner, so `ubuntu-22.04` is `ubuntu22` and a
+/// release newer than this table knows is named the same way. Every other
+/// label, `ubuntu-latest` included, gets `ubuntu-latest`'s.
+pub fn image_os(runs_on: &str) -> String {
+    let major = runs_on
+        .trim()
+        .strip_prefix("ubuntu-")
+        .and_then(|rest| rest.split('-').next())
+        .and_then(|release| release.strip_suffix(".04"))
+        .filter(|major| !major.is_empty() && major.bytes().all(|b| b.is_ascii_digit()));
+    match major {
+        Some(major) => format!("ubuntu{major}"),
+        None => IMAGE_OS.to_string(),
+    }
+}
+
+/// Give a job the `ImageOS` of its own runner, where
+/// [`apply_github_container_context`] set one for the run and the workflow
+/// didn't set its own in `user_env`. Only the first label counts, as only
+/// it picks the image.
+pub fn set_image_os(
+    env: &mut HashMap<String, String>,
+    user_env: &HashMap<String, String>,
+    runs_on: &Option<Vec<String>>,
+) {
+    if !env.contains_key("ImageOS") || user_env.contains_key("ImageOS") {
+        return;
+    }
+    let label = runs_on
+        .as_ref()
+        .and_then(|labels| labels.first())
+        .map_or("ubuntu-latest", String::as_str);
+    env.insert("ImageOS".to_string(), image_os(label));
 }
 
 /// Replace host paths with what a GitLab job sees inside a container. GitLab
@@ -622,8 +667,40 @@ mod tests {
         assert_eq!(env["GITHUB_WORKSPACE"], "/github/workspace");
         assert_eq!(env["RUNNER_TEMP"], "/github/workflow/runner_temp");
         assert_eq!(env["RUNNER_TOOL_CACHE"], "/opt/hostedtoolcache");
+        assert_eq!(env["ImageOS"], "ubuntu24");
         assert_eq!(env["OTHER"], "kept");
         assert!(!env.contains_key("CI_PROJECT_DIR"));
+    }
+
+    #[test]
+    fn image_os_follows_the_runner_a_job_runs_on() {
+        assert_eq!(image_os("ubuntu-latest"), "ubuntu24");
+        assert_eq!(image_os("ubuntu-24.04"), "ubuntu24");
+        assert_eq!(image_os("ubuntu-22.04"), "ubuntu22");
+        assert_eq!(image_os("ubuntu-20.04-medium"), "ubuntu20");
+        // A release newer than any listed here is named as GitHub names it.
+        assert_eq!(image_os("ubuntu-26.04"), "ubuntu26");
+        assert_eq!(image_os("ubuntu-26.04-arm"), "ubuntu26");
+        // Not a release: `ubuntu-latest`'s.
+        assert_eq!(image_os("ubuntu-24.10"), "ubuntu24");
+        assert_eq!(image_os("ubuntu-.04"), "ubuntu24");
+        // Runs in ubuntu:latest, as a matrix's `${{ matrix.os }}` does.
+        assert_eq!(image_os("macos-latest"), "ubuntu24");
+        assert_eq!(image_os("${{ matrix.os }}"), "ubuntu24");
+
+        let runs_on = Some(vec!["ubuntu-22.04".to_string()]);
+        let mut env = HashMap::from([("ImageOS".to_string(), IMAGE_OS.to_string())]);
+        set_image_os(&mut env, &HashMap::new(), &runs_on);
+        assert_eq!(env["ImageOS"], "ubuntu22");
+        // The workflow's own value stays.
+        let user = HashMap::from([("ImageOS".to_string(), "mine".to_string())]);
+        let mut env = user.clone();
+        set_image_os(&mut env, &user, &runs_on);
+        assert_eq!(env["ImageOS"], "mine");
+        // Not set without a container, where the host's environment is used.
+        let mut env = HashMap::new();
+        set_image_os(&mut env, &HashMap::new(), &runs_on);
+        assert!(!env.contains_key("ImageOS"));
     }
 
     #[test]

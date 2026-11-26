@@ -332,12 +332,21 @@
       "pattern": "^.*\\$\\{\\{(.|[\r\n])*\\}\\}.*$"
     },
     "globs": {
-      "type": "array",
-      "items": {
-        "type": "string",
-        "minLength": 1
-      },
-      "minItems": 0
+      "$comment": "GitHub also takes a single pattern as a string, such as `branches: \"**\"`.",
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 0
+        }
+      ]
     },
     "machine": {
       "type": "string",

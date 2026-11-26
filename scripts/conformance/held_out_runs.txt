@@ -1,9 +1,10 @@
 # Held-out runs: repositories no wrkflw change was made against, so their
-# result says how wrkflw does on a repository it has never seen. Picked on
-# 2026-11-20 for variety: services (lib/pq, go-sql-driver/mysql,
-# jazzband/django-redis), wide OS matrices (sharkdp/fd, sharkdp/hyperfine,
-# psf/requests), a known failure (jazzband/django-redis), a schedule run
-# (dtolnay/anyhow), and Python, Node, Go and Rust projects.
+# result says how wrkflw does on a repository it has never seen. The first
+# fourteen, picked on 2026-11-20, moved to compare_runs.txt once wrkflw was
+# fixed against what they found. These replaced them the same day, for
+# variety: services (jackc/pgx, redis/go-redis), wide OS and version
+# matrices (python-attrs/attrs, psf/black, koajs/koa), and Python, Node,
+# Go and Rust projects.
 #
 # Run it with:
 #   scripts/conformance/compare_sweep.sh scripts/conformance/held_out_runs.txt
@@ -11,17 +12,17 @@
 # sweep's. Don't fix wrkflw against a run here and keep calling it held
 # out: move the repository to compare_runs.txt and pick a new one.
 #   owner/repo  run_id  [VAR=value ...]
-pallets/markupsafe       37080278497
-psf/requests             40366789388
-encode/httpx             43942265472
-sharkdp/hyperfine        38224324422
-sharkdp/fd               43561890385
-expressjs/express        41517558311
-sindresorhus/execa       44272044440
-urfave/cli               42738336663
-BurntSushi/memchr        31414505747
-go-chi/chi               42388391568
-lib/pq                   43793073655
-go-sql-driver/mysql      44281558144
-jazzband/django-redis    42917669996
-dtolnay/anyhow           44655613210
+python-attrs/attrs       43613447530
+encode/starlette         42207316546
+pytest-dev/pluggy        44480985111
+psf/black                44684189730
+gin-gonic/gin            38023728773
+labstack/echo            43680384519
+jackc/pgx                43882104458
+redis/go-redis           44747031452
+tokio-rs/bytes           44159783332
+serde-rs/json            43809170837
+rust-lang/regex          44399608621
+uuidjs/uuid              41325019315
+yargs/yargs              44016421281
+koajs/koa                44478405112

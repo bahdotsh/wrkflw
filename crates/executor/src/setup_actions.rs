@@ -956,18 +956,23 @@ pub(crate) fn get_install_script(language: &str, version: &str) -> String {
                 v = version
             )
         }
-        // The setup script is saved before it runs: piped into a shell, a
-        // failed download is an empty script that succeeds, and apt then
-        // installs the distribution's own, older Node.js without a word.
+        // A major, from nodejs.org's build of its newest release as the
+        // runner's Node is: nodesource has no package of an end-of-life
+        // major, such as 19, for a newer distribution, such as Ubuntu
+        // 26.04. nodesource's only when nodejs.org builds nothing for this
+        // machine.
         "node" => {
-            // Strip .x suffix for nodesource URL (e.g., "16.x" -> "16")
+            // Strip .x suffix (e.g., "16.x" -> "16")
             let major = version.split('.').next().unwrap_or(version);
-            format!(
-                "curl -fsSL https://deb.nodesource.com/setup_{}.x -o /tmp/node-setup.sh && \
-                 bash /tmp/node-setup.sh && rm -f /tmp/node-setup.sh && \
-                 apt-get install -y nodejs && node --version",
-                major
-            )
+            if !major.is_empty() && major.bytes().all(|b| b.is_ascii_digit()) {
+                format!(
+                    "({}) || ({})",
+                    node_tarball_install(major, NodeTarball::Replace),
+                    nodesource_install(major)
+                )
+            } else {
+                nodesource_install(major)
+            }
         }
         // A runtime's install is a layer of its own, on top of the shared
         // packages' layer, which the builder may have cached weeks ago: an
@@ -994,14 +999,20 @@ pub(crate) fn get_install_script(language: &str, version: &str) -> String {
         // interpreters carry no such marker, so it goes. The directory pip
         // installs commands into, such as `pytest` or `tox`, is linked to
         // [`PYTHON_SCRIPTS_DIR`], which the image puts first on `PATH`, as
-        // setup-python does with its own.
+        // setup-python does with its own. Its interpreters, `python3.10`
+        // and the like, are linked one by one into [`PYTHON_LINKS_DIR`],
+        // ahead of it: reached through a linked directory, Python 3.10 and
+        // older look for their standard library beside the link, and fail
+        // to start ("Could not find platform independent libraries").
         "python" => {
             format!(
                 "{install_uv} && \
                  uv python install '{req}' && \
                  p=\"$(uv python find '{req}')\" && \
                  ln -sf \"$p\" /usr/local/bin/python && ln -sf \"$p\" /usr/local/bin/python3 && \
-                 ln -sfn \"$(\"$p\" -c '{scripts}')\" {scripts_dir} && \
+                 s=\"$(\"$p\" -c '{scripts}')\" && ln -sfn \"$s\" {scripts_dir} && \
+                 mkdir -p {links_dir} && \
+                 for f in \"$s\"/python* \"$s\"/pypy*; do [ ! -e \"$f\" ] || ln -sf \"$f\" {links_dir}/; done && \
                  \"$p\" -c '{drop_marker}' && \
                  (\"$p\" -m pip --version >/dev/null 2>&1 || \"$p\" -m ensurepip --upgrade) && \
                  printf '#!/bin/sh\\nexec /usr/local/bin/python -m pip \"$@\"\\n' > /usr/local/bin/pip && \
@@ -1011,6 +1022,7 @@ pub(crate) fn get_install_script(language: &str, version: &str) -> String {
                 drop_marker = DROP_EXTERNALLY_MANAGED,
                 scripts = PRINT_SCRIPTS_DIR,
                 scripts_dir = PYTHON_SCRIPTS_DIR,
+                links_dir = PYTHON_LINKS_DIR,
             )
         }
         "uv" => uv_install_command(version),
@@ -1168,6 +1180,11 @@ pub(crate) const UV_PYTHON_DIR: &str = "/opt/uv/python";
 /// as its own.
 pub(crate) const PYTHON_SCRIPTS_DIR: &str = "/opt/uv/python-bin";
 
+/// A directory of links to each setup-python interpreter itself, such as
+/// `python3.10`, put ahead of [`PYTHON_SCRIPTS_DIR`] on `PATH`, so an
+/// interpreter is always reached through a link to its file.
+pub(crate) const PYTHON_LINKS_DIR: &str = "/opt/uv/python-links";
+
 /// Python that prints the scripts directory of the interpreter running it.
 /// Single-quoted in the shell, so it holds none.
 const PRINT_SCRIPTS_DIR: &str = "import sysconfig; print(sysconfig.get_path(\"scripts\"))";
@@ -1255,10 +1272,43 @@ pub(crate) const RUNNER_NODE_MAJOR: &str = "22";
 /// other installs trust where they fetch from, which run a script from
 /// astral.sh, sh.rustup.rs or deb.nodesource.com as root.
 pub(crate) fn runner_node_install() -> String {
-    let dist = format!("https://nodejs.org/dist/latest-v{}.x", RUNNER_NODE_MAJOR);
     format!(
-        "(command -v node >/dev/null 2>&1 || (\
-         dir=$(mktemp -d) && (\
+        "(command -v node >/dev/null 2>&1 || ({}) || ({}))",
+        node_tarball_install(RUNNER_NODE_MAJOR, NodeTarball::Fresh),
+        nodesource_install(RUNNER_NODE_MAJOR),
+    )
+}
+
+/// Where [`node_tarball_install`] puts Node.js.
+#[derive(Clone, Copy)]
+enum NodeTarball {
+    /// Under a `/usr/local` with no Node in it: the runner image's own,
+    /// installed only when `command -v node` finds none. Its text is part
+    /// of `docker/runner.Dockerfile`, and so of the image's tag.
+    Fresh,
+    /// Over the runner's Node in `/usr/local`, for setup-node. The new
+    /// build has to run before anything is removed, so a machine it can't
+    /// run on falls back to nodesource with the runner's Node intact, and
+    /// the old `npm`, `corepack` and headers go before the copy, so no
+    /// file of the other major stays among the new ones.
+    Replace,
+}
+
+/// Installs the newest release of Node.js `major` from nodejs.org, as
+/// [`runner_node_install`] describes, failing on a machine nodejs.org builds
+/// nothing for.
+fn node_tarball_install(major: &str, into: NodeTarball) -> String {
+    let dist = format!("https://nodejs.org/dist/latest-v{major}.x");
+    let replace = match into {
+        NodeTarball::Fresh => "",
+        NodeTarball::Replace => {
+            "node/bin/node --version >/dev/null && \
+             rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
+             /usr/local/include/node && "
+        }
+    };
+    format!(
+        "dir=$(mktemp -d) && (\
          cd \"$dir\" && \
          arch=$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/') && \
          curl -fsSLO {dist}/SHASUMS256.txt && \
@@ -1268,9 +1318,20 @@ pub(crate) fn runner_node_install() -> String {
          grep \" $file\\$\" SHASUMS256.txt > node.sum && sha256sum -c node.sum >/dev/null && \
          mkdir node && tar -xzf \"$file\" -C node --strip-components=1 --no-same-owner \
          --exclude='*/CHANGELOG.md' --exclude='*/LICENSE' --exclude='*/README.md' && \
-         cp -a node/. /usr/local/); \
-         status=$?; [ -z \"$dir\" ] || rm -rf \"$dir\"; exit $status) || ({distribution}))",
-        distribution = get_install_script("node", RUNNER_NODE_MAJOR),
+         {replace}cp -a node/. /usr/local/); \
+         status=$?; [ -z \"$dir\" ] || rm -rf \"$dir\"; exit $status",
+    )
+}
+
+/// Installs Node.js `major` (or `lts`) from nodesource's apt repository.
+/// The setup script is saved before it runs: piped into a shell, a failed
+/// download is an empty script that succeeds, and apt then installs the
+/// distribution's own, older Node.js without a word.
+pub(crate) fn nodesource_install(major: &str) -> String {
+    format!(
+        "curl -fsSL https://deb.nodesource.com/setup_{major}.x -o /tmp/node-setup.sh && \
+         bash /tmp/node-setup.sh && rm -f /tmp/node-setup.sh && \
+         apt-get install -y nodejs && node --version"
     )
 }
 

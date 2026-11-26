@@ -332,12 +332,21 @@
       "pattern": "^.*\\$\\{\\{(.|[\r\n])*\\}\\}.*$"
     },
     "globs": {
-      "type": "array",
-      "items": {
-        "type": "string",
-        "minLength": 1
-      },
-      "minItems": 1
+      "$comment": "GitHub also takes a single pattern as a string, such as `branches: \"**\"`.",
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 0
+        }
+      ]
     },
     "machine": {
       "type": "string",
@@ -1608,20 +1617,28 @@
             "workflow_dispatch": {
               "$comment": "https://github.blog/changelog/2020-07-06-github-actions-manual-triggers-with-workflow_dispatch/",
               "description": "You can now create workflows that are manually triggered with the new workflow_dispatch event. You will then see a 'Run workflow' button on the Actions tab, enabling you to easily trigger a run.",
-              "properties": {
-                "inputs": {
-                  "$comment": "https://help.github.com/en/github/automating-your-workflow-with-github-actions/metadata-syntax-for-github-actions#inputs",
-                  "description": "Input parameters allow you to specify data that the action expects to use during runtime. GitHub stores input parameters as environment variables. Input ids with uppercase letters are converted to lowercase during runtime. We recommended using lowercase input ids.",
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
                   "type": "object",
-                  "patternProperties": {
-                    "^[_a-zA-Z][a-zA-Z0-9_-]*$": {
-                      "$ref": "#/definitions/workflowDispatchInput"
+                  "properties": {
+                    "inputs": {
+                      "$comment": "https://help.github.com/en/github/automating-your-workflow-with-github-actions/metadata-syntax-for-github-actions#inputs",
+                      "description": "Input parameters allow you to specify data that the action expects to use during runtime. GitHub stores input parameters as environment variables. Input ids with uppercase letters are converted to lowercase during runtime. We recommended using lowercase input ids.",
+                      "type": "object",
+                      "patternProperties": {
+                        "^[_a-zA-Z][a-zA-Z0-9_-]*$": {
+                          "$ref": "#/definitions/workflowDispatchInput"
+                        }
+                      },
+                      "additionalProperties": false
                     }
                   },
                   "additionalProperties": false
                 }
-              },
-              "additionalProperties": false
+              ]
             },
             "workflow_run": {
               "$comment": "https://docs.github.com/en/actions/reference/events-that-trigger-workflows#workflow_run",

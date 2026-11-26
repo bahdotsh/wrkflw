@@ -55,10 +55,7 @@ pub fn matches_paths(
 /// so the fallback was removed. The regression is pinned by
 /// `star_pattern_does_not_match_nested_file_gha_semantics`.
 fn matches_any_pattern(file: &str, patterns: &[GlobPattern]) -> bool {
-    let opts = GlobPattern::match_options();
-    patterns
-        .iter()
-        .any(|gp| gp.pattern.matches_with(file, opts))
+    patterns.iter().any(|gp| gp.matches(file))
 }
 
 #[cfg(test)]

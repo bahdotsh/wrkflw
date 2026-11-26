@@ -374,7 +374,27 @@ jobs:
 #[tokio::test]
 async fn reusable_workflow_jobs_skip_after_failed_need() {
     // Local reusable-workflow paths must stay inside the current directory
-    // (the repository root), so the temp dir is created there.
+    // (the repository root), so the temp dir is created there. A run that
+    // was killed leaves its directory behind: clear those out, but not one
+    // young enough to belong to a run going on now.
+    for entry in std::fs::read_dir(".").unwrap().flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".needs-reusable-")
+        {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > std::time::Duration::from_secs(3600));
+        if stale {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
     let dir = tempfile::Builder::new()
         .prefix(".needs-reusable-")
         .tempdir_in(".")

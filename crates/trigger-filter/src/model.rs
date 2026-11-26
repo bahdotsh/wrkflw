@@ -168,17 +168,49 @@ mod tests {
 /// The source is retained so diagnostic messages can refer back to what the
 /// user wrote in the workflow YAML (e.g. `branch 'main' did not match
 /// ["release/*"]` instead of the compiled `Pattern`'s `Debug` output).
+///
+/// GitHub lets `**` sit inside a path component, as in `**.go` or
+/// `docs/**.md`, where it matches any characters, `/` included. The `glob`
+/// crate only takes `**` as a whole component, so such a pattern compiles
+/// to a few that together match the same: `pattern` and `alternatives`.
+/// Match with [`GlobPattern::matches`], which tries them all; they are
+/// private, so nothing can match against only the first.
 #[derive(Debug, Clone)]
 pub struct GlobPattern {
     pub source: String,
-    pub pattern: Pattern,
+    pattern: Pattern,
+    alternatives: Vec<Pattern>,
 }
+
+/// At most this many patterns stand for one source pattern: each component
+/// with `**` inside it doubles them, so four such components fit and a
+/// fifth is refused rather than matched with less than it says.
+const MAX_GLOB_ALTERNATIVES: usize = 16;
 
 impl GlobPattern {
     pub fn new(source: impl Into<String>) -> Result<Self, PatternError> {
         let source = source.into();
-        let pattern = Pattern::new(&source)?;
-        Ok(Self { source, pattern })
+        let mut compiled = expand_inner_double_stars(&source)?
+            .iter()
+            .map(|alternative| Pattern::new(alternative))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter();
+        // `expand_inner_double_stars` always returns at least the source.
+        let pattern = compiled.next().expect("at least one pattern");
+        Ok(Self {
+            source,
+            pattern,
+            alternatives: compiled.collect(),
+        })
+    }
+
+    /// Whether `text`, a ref name or a path, matches, with
+    /// [`GlobPattern::match_options`].
+    pub fn matches(&self, text: &str) -> bool {
+        let opts = Self::match_options();
+        std::iter::once(&self.pattern)
+            .chain(&self.alternatives)
+            .any(|pattern| pattern.matches_with(text, opts))
     }
 
     /// Match options used for both ref and path glob matching.
@@ -191,6 +223,140 @@ impl GlobPattern {
             require_literal_leading_dot: false,
         }
     }
+}
+
+/// The `glob` patterns that together match what GitHub matches with
+/// `source`. A component holding `**` next to other characters, `P**S`,
+/// matches `P`, anything, then `S`: within one component that is `P*S`, and
+/// across several `P*/**/*S`. Each `**` in a component, `a**b**c` having
+/// two, makes that choice of its own. Patterns with no such component come
+/// back unchanged, alone. More than [`MAX_GLOB_ALTERNATIVES`] is an error.
+///
+/// Errors in the rest of the pattern, such as an unclosed `[`, are found in
+/// the source itself, so their position is the one the user wrote.
+fn expand_inner_double_stars(source: &str) -> Result<Vec<String>, PatternError> {
+    Pattern::new(&same_length_check(source))?;
+    let mut expanded = vec![String::new()];
+    let mut offset = 0;
+    for (index, component) in source.split('/').enumerate() {
+        let start = offset;
+        offset += component.len() + 1;
+        let choices: Vec<String> = match inner_double_star_pieces(component) {
+            Some(pieces) => {
+                let mut choices = vec![pieces[0].to_string()];
+                for piece in &pieces[1..] {
+                    choices = choices
+                        .iter()
+                        .flat_map(|head| {
+                            [format!("{head}*{piece}"), format!("{head}*/**/*{piece}")]
+                        })
+                        .collect();
+                }
+                choices
+            }
+            None => vec![component.to_string()],
+        };
+        if expanded.len() * choices.len() > MAX_GLOB_ALTERNATIVES {
+            return Err(PatternError {
+                pos: start,
+                msg: "too many `**` inside path components (at most 4)",
+            });
+        }
+        expanded = expanded
+            .iter()
+            .flat_map(|head| {
+                choices.iter().map(move |choice| {
+                    if index == 0 {
+                        choice.clone()
+                    } else {
+                        format!("{head}/{choice}")
+                    }
+                })
+            })
+            .collect();
+    }
+    Ok(expanded)
+}
+
+/// `component` split at each run of two or more `*` outside a `[...]`
+/// class, all of which GitHub takes as `**`, or `None` when it has none or
+/// is `**` alone, which `glob` takes itself. A `*` inside a class is a
+/// literal character and stays where it is.
+fn inner_double_star_pieces(component: &str) -> Option<Vec<&str>> {
+    if component == "**" {
+        return None;
+    }
+    let runs = star_runs(component);
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    for (at, end) in runs.into_iter().filter(|(at, end)| end - at >= 2) {
+        pieces.push(&component[start..at]);
+        start = end;
+    }
+    if pieces.is_empty() {
+        return None;
+    }
+    pieces.push(&component[start..]);
+    Some(pieces)
+}
+
+/// The byte ranges of each run of `*` in `component` outside a `[...]`
+/// class, read as `glob` reads a class: a `]` right after `[` or `[!` is a
+/// member, not the end, and a `[` with no `]` to close it is left for
+/// `glob` to refuse.
+fn star_runs(component: &str) -> Vec<(usize, usize)> {
+    let bytes = component.as_bytes();
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'[' => {
+                let mut j = i + 1;
+                if bytes.get(j) == Some(&b'!') {
+                    j += 1;
+                }
+                if bytes.get(j) == Some(&b']') {
+                    j += 1;
+                }
+                match bytes[j.min(bytes.len())..].iter().position(|&b| b == b']') {
+                    Some(close) => i = j + close + 1,
+                    None => i += 1,
+                }
+            }
+            b'*' => {
+                let start = i;
+                while bytes.get(i) == Some(&b'*') {
+                    i += 1;
+                }
+                runs.push((start, i));
+            }
+            _ => i += 1,
+        }
+    }
+    runs
+}
+
+/// `source` with each run of `*` outside a class, in a component that has
+/// `**` inside it, written `*?..`, of the same length, which `glob`
+/// accepts: what is left to refuse is the rest of the pattern, at the
+/// position it has in `source`.
+fn same_length_check(source: &str) -> String {
+    source
+        .split('/')
+        .map(|component| {
+            if inner_double_star_pieces(component).is_none() {
+                return component.to_string();
+            }
+            let mut out = component.to_string();
+            // Same length, so each run's position holds after the last.
+            for (at, end) in star_runs(component) {
+                let run = format!("*{}", "?".repeat(end - at - 1));
+                out.replace_range(at..end, &run);
+            }
+            out
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Parsed trigger configuration for a single event type (e.g., push, pull_request).
@@ -306,4 +472,96 @@ pub struct TriggerMatchResult {
     pub matches: bool,
     pub matched_event: Option<String>,
     pub reason: String,
+}
+
+#[cfg(test)]
+mod glob_pattern_tests {
+    use super::GlobPattern;
+
+    #[test]
+    fn double_star_inside_a_component_matches_across_directories() {
+        // lib/pq's `paths: ['**.go']`: any Go file, at any depth.
+        let go = GlobPattern::new("**.go").unwrap();
+        assert!(go.matches("conn.go"));
+        assert!(go.matches("internal/proto/types.go"));
+        assert!(!go.matches("go.mod"));
+        assert!(!go.matches("README.md"));
+
+        let docs = GlobPattern::new("docs/**.md").unwrap();
+        assert!(docs.matches("docs/index.md"));
+        assert!(docs.matches("docs/guide/install.md"));
+        assert!(!docs.matches("src/index.md"));
+
+        let prefixed = GlobPattern::new("release-**").unwrap();
+        assert!(prefixed.matches("release-1.2"));
+        assert!(prefixed.matches("release-1.2/hotfix"));
+        assert!(!prefixed.matches("main"));
+    }
+
+    #[test]
+    fn whole_component_patterns_are_unchanged() {
+        let all = GlobPattern::new("**").unwrap();
+        assert!(all.matches("feature/x"));
+        let nested = GlobPattern::new("src/**/*.rs").unwrap();
+        assert!(nested.matches("src/a/b.rs"));
+        assert!(nested.matches("src/b.rs"));
+        let star = GlobPattern::new("*.md").unwrap();
+        assert!(star.matches("README.md"));
+        assert!(!star.matches("docs/README.md"));
+    }
+
+    #[test]
+    fn four_inner_double_stars_match_fully_and_a_fifth_is_refused() {
+        let pattern = GlobPattern::new("a**/b**/c**/d**").unwrap();
+        assert!(pattern.matches("a/b/c/d"));
+        // Each component's `**` crosses directories, the last one's too.
+        assert!(pattern.matches("a1/x/b2/c3/y/z/d4"));
+        assert!(pattern.matches("a/b/c/x/d"));
+        let refused = GlobPattern::new("a**/b**/c**/d**/e**").unwrap_err();
+        assert_eq!(refused.pos, "a**/b**/c**/d**/".len());
+    }
+
+    #[test]
+    fn several_double_stars_in_one_component_each_cross_directories() {
+        let pattern = GlobPattern::new("a**b**c").unwrap();
+        assert!(pattern.matches("abc"));
+        assert!(pattern.matches("a1b2c"));
+        assert!(pattern.matches("a/x/b/y/c"));
+        assert!(pattern.matches("ax/b/yc"));
+        assert!(!pattern.matches("a/c"));
+        // `***` is `**`.
+        assert!(GlobPattern::new("src/***.rs")
+            .unwrap()
+            .matches("src/a/b.rs"));
+        // Two in one component count twice toward the limit.
+        assert!(GlobPattern::new("a**b**/c**d**").is_ok());
+        assert!(GlobPattern::new("a**b**c/d**e**f/g**").is_err());
+    }
+
+    /// `*` inside a `[...]` class is a literal character, so `**` there is
+    /// no wildcard and the component is left as written.
+    #[test]
+    fn stars_inside_a_class_are_not_split() {
+        let class = GlobPattern::new("[**]x").unwrap();
+        assert!(class.matches("*x"));
+        assert!(!class.matches("ax"));
+        assert!(!class.matches("a/x"));
+        // `]` first in a class is a member, so the class runs on past it.
+        let bracket = GlobPattern::new("[]**]x").unwrap();
+        assert!(bracket.matches("]x"));
+        assert!(bracket.matches("*x"));
+        // A real `**` beside a class still crosses directories.
+        let mixed = GlobPattern::new("[ab]**.go").unwrap();
+        assert!(mixed.matches("a.go"));
+        assert!(mixed.matches("b/c/d.go"));
+        assert!(!mixed.matches("c.go"));
+    }
+
+    #[test]
+    fn an_error_elsewhere_is_placed_in_the_pattern_as_written() {
+        let error = GlobPattern::new("docs/**.md/[ab").unwrap_err();
+        let plain = glob::Pattern::new("docs/x*.md/[ab").unwrap_err();
+        assert_eq!(error.pos, plain.pos);
+        assert_eq!(error.msg, plain.msg);
+    }
 }

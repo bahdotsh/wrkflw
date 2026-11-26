@@ -12,7 +12,6 @@ use thiserror::Error;
 
 use crate::acceleration;
 use crate::action_resolver::{self, is_git_sha};
-use crate::checkout_sync::copy_directory_contents;
 use crate::dependency;
 use crate::docker;
 use crate::environment;
@@ -29,8 +28,8 @@ use crate::matrix_fold::{matrix_twins, repeated_leg};
 use crate::podman;
 use crate::setup_actions::{
     detect_setup, runner_node_install, rust_toolchain_extras, static_input, unrun_action_cause,
-    BuiltRuntimes, SetupDetection, SetupRuntime, NO_IMPLEMENTATION, PYTHON_SCRIPTS_DIR,
-    SETUP_ACTIONS, UV_PYTHON_DIR,
+    BuiltRuntimes, SetupDetection, SetupRuntime, NO_IMPLEMENTATION, PYTHON_LINKS_DIR,
+    PYTHON_SCRIPTS_DIR, SETUP_ACTIONS, UV_PYTHON_DIR,
 };
 use wrkflw_logging;
 use wrkflw_matrix::MatrixCombination;
@@ -2360,6 +2359,17 @@ const RUNNER_TOOLS: &[&str] = &[
     "python3",
     "python3-pip",
     "python3-venv",
+    // `python` as `python3`, which `shell: python` runs: the hosted runner
+    // has it, and go-sql-driver/mysql builds its matrix that way.
+    "python-is-python3",
+    // The hosted runner has it, and prebuilt clients link it: the `mariadb`
+    // that shogo82148/actions-setup-mysql installs (go-sql-driver/mysql).
+    "libncurses6",
+    // The hosted runner has them, and a package built from source needs
+    // them where no wheel fits: `cryptography` for PyPy on arm64 finds no
+    // OpenSSL without them (psf/requests).
+    "libssl-dev",
+    "pkg-config",
 ];
 
 /// Installs the GitHub CLI from GitHub's own apt repository, the way the
@@ -2510,6 +2520,14 @@ fn combined_dockerfile_tail(runtimes: &[SetupRuntime], tools: RunnerTools) -> St
             format!("{}/.rustup", crate::runner_user::HOME),
         ));
     }
+    // A toolchain the image installed sits in a lower layer of the
+    // container's overlay filesystem, which refuses to rename its
+    // directories ("Invalid cross-device link"), so a step's rustup update
+    // of it fails, as BurntSushi/memchr's nightly job's did. This lets
+    // rustup copy instead, as GitHub's runner's plain disk never needs.
+    if has_rust {
+        env.push(("RUSTUP_PERMIT_COPY_RENAME".to_string(), "1".to_string()));
+    }
     if runtimes.iter().any(|rt| rt.language == "python") {
         env.push((
             "UV_PYTHON_INSTALL_DIR".to_string(),
@@ -2550,11 +2568,13 @@ fn combined_dockerfile_tail(runtimes: &[SetupRuntime], tools: RunnerTools) -> St
     // images do this with Node, which would shadow the version a setup action
     // just installed. Every install script lands in one of these directories.
     // setup-python puts its interpreter's scripts first, so what `pip
-    // install` adds runs by name.
+    // install` adds runs by name, and its interpreters, by every name,
+    // ahead of them: [`PYTHON_LINKS_DIR`] says why.
     // What `cargo install` installs goes on PATH, as `~/.cargo/bin` is on
     // the hosted runner's.
     let mut path: Vec<String> = Vec::new();
     if runtimes.iter().any(|rt| rt.language == "python") {
+        path.push(PYTHON_LINKS_DIR.to_string());
         path.push(PYTHON_SCRIPTS_DIR.to_string());
     }
     if has_rust {
@@ -3687,7 +3707,7 @@ async fn execute_job_with_matrix(
                 image_ahead,
                 crate::job_memory::metered(
                     job_session::with_job_session(job, runtime, mapped, Box::pin(execute_job(ctx))),
-                    job_passed,
+                    measured_to_its_end(job.steps.len()),
                 ),
             ))
             .await;
@@ -3810,6 +3830,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     // mirrors only the user-declared slice for `toJSON(env)`.
     let mut job_env = ctx.env_context.clone();
     let mut job_user_env = ctx.user_env.clone();
+    environment::set_image_os(&mut job_env, &job_user_env, &job.runs_on);
 
     // Add container-level environment variables (lowest precedence).
     // Container env is user-declared (jobs.<id>.container.env in YAML) — mirror
@@ -4177,7 +4198,7 @@ async fn execute_matrix_combinations(
                                 &ctx.services,
                             ),
                         ),
-                        job_passed,
+                        measured_to_its_end(ctx.job_template.steps.len()),
                     )
                     .await
                 }
@@ -4314,6 +4335,7 @@ async fn execute_matrix_job(
     let mut job_env = base_env_context.clone();
     let mut job_user_env = base_user_env.clone();
     environment::add_matrix_context(&mut job_env, combination);
+    environment::set_image_os(&mut job_env, &job_user_env, &job_template.runs_on);
 
     // Add container-level environment variables (lowest precedence). User-declared.
     if let Some(ref container) = job_template.container {
@@ -4652,15 +4674,45 @@ impl JobServices<'_> {
     }
 }
 
-/// Flush pending cache saves. Called at end-of-job only when the job succeeded,
-/// matching GitHub Actions' behavior where `actions/cache` saves in a post-step
-/// hook that only runs after all steps complete and the job succeeds.
-/// Whether `result` is a job that ran and passed, so what it used stands
-/// for a whole run of it.
-fn job_passed(result: &Result<JobResult, ExecutionError>) -> bool {
-    result
-        .as_ref()
-        .is_ok_and(|job| job.status == JobStatus::Success && job.repeated_from.is_none())
+/// Whether a job's measured memory says what it needs: it passed, or it
+/// failed only at its last step, as when only a coverage upload at the end
+/// failed. A job stopped part way may not have reached its heaviest step.
+/// Keeping only passes left sindresorhus/execa's legs, all failing at their
+/// last step, unmeasured on every run, so they ran one at a time.
+/// `step_count` is the number of steps the job declares.
+///
+/// A last step that failed early, such as a `cargo test` that didn't
+/// compile, measures less than the step needs. That is kept anyway: the
+/// reservation is the highest of the recent peaks, never lower than the
+/// highest seen, so the short run lowers nothing a whole one measured, and
+/// only a job never measured whole can start with too little. If it then
+/// runs out of memory, the kill forgets it and it runs alone again.
+fn measured_to_its_end(
+    step_count: usize,
+) -> impl FnOnce(&Result<JobResult, ExecutionError>) -> bool {
+    move |result| {
+        result.as_ref().is_ok_and(|job| {
+            job.repeated_from.is_none()
+                && match job.status {
+                    JobStatus::Success => true,
+                    JobStatus::Failure => failed_at_its_last_step(&job.steps, step_count),
+                    JobStatus::Skipped => false,
+                }
+        })
+    }
+}
+
+/// Whether the first step of `steps` to fail, by its conclusion, is the
+/// last of the job's `step_count` steps, or a post after them. The step
+/// loop stops at a failure and records nothing for the steps it didn't
+/// reach, so a failure any earlier means the job stopped part way. A step
+/// whose failure `continue-on-error` allowed concludes as a success, and
+/// the job went on past it.
+fn failed_at_its_last_step(steps: &[StepResult], step_count: usize) -> bool {
+    steps
+        .iter()
+        .position(|step| step.conclusion == StepStatus::Failure)
+        .is_some_and(|first| step_count > 0 && first + 1 >= step_count)
 }
 
 /// The id a job's memory measurements are kept under.
@@ -4676,6 +4728,9 @@ fn leg_family_memory_id(workflow: &str, job: &str) -> Option<String> {
     job_memory_id(workflow, &format!("{job}\0legs"))
 }
 
+/// Flush pending cache saves. Called at end-of-job only when the job succeeded,
+/// matching GitHub Actions' behavior where `actions/cache` saves in a post-step
+/// hook that only runs after all steps complete and the job succeeds.
 async fn flush_pending_cache_saves(
     pending: &std::sync::Mutex<Vec<PendingCacheSave>>,
     cache_store: &crate::cache::CacheStore,
@@ -5427,6 +5482,99 @@ fn workspace_relative_input(path: &str, job_env: &HashMap<String, String>) -> St
     }
 }
 
+/// Where `actions/checkout` puts the repository: the workspace, or the
+/// directory under it its `path:` input names. Its own repository only: a
+/// `repository:` naming another one keeps the workspace, as before. A path
+/// outside the workspace is refused, as actions/checkout refuses it.
+fn checkout_destination(ctx: &StepExecutionContext<'_>) -> Result<PathBuf, String> {
+    let Some(path) = checkout_input(ctx, "path").filter(|_| checks_out_own_repository(ctx)) else {
+        return Ok(ctx.working_dir.to_path_buf());
+    };
+    let relative = workspace_relative_input(&path, ctx.job_env);
+    let relative = Path::new(&relative);
+    // Only plain names: `..`, a root and, on Windows, a drive prefix all
+    // leave the workspace, and `/elsewhere` is not `is_absolute()` there.
+    if relative.components().any(|c| {
+        !matches!(
+            c,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    }) {
+        return Err(format!(
+            "actions/checkout: path '{path}' is not under the workspace"
+        ));
+    }
+    let destination = ctx.working_dir.join(relative);
+    // A link already in the workspace may lead out of it: what exists of
+    // the path is checked where it really is. A workspace that doesn't
+    // exist yet holds no link; one that can't be resolved for another
+    // reason can't be checked, so the path is refused.
+    let root = match ctx.working_dir.canonicalize() {
+        Ok(root) => root,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(destination),
+        Err(e) => {
+            return Err(format!(
+                "actions/checkout: can't check that path '{path}' stays in the workspace: {e}"
+            ));
+        }
+    };
+    let existing = destination
+        .ancestors()
+        .find(|part| part.symlink_metadata().is_ok());
+    let inside = existing
+        .map(|part| {
+            part.canonicalize()
+                .is_ok_and(|real| real.starts_with(&root))
+        })
+        .unwrap_or(true);
+    if !inside {
+        return Err(format!(
+            "actions/checkout: path '{path}' leads out of the workspace through a link"
+        ));
+    }
+    Ok(destination)
+}
+
+/// The `actions/checkout` input `key` as the step gives it, or `None` when
+/// it is missing or empty.
+fn checkout_input(ctx: &StepExecutionContext<'_>, key: &str) -> Option<String> {
+    ctx.step
+        .with
+        .as_ref()
+        .and_then(|with| with.get(key))
+        .map(|value| preprocess_with_value(value, ctx).trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Whether the checkout is of the run's own repository, the only one
+/// wrkflw copies: no `repository:`, or one naming it.
+fn checks_out_own_repository(ctx: &StepExecutionContext<'_>) -> bool {
+    match checkout_input(ctx, "repository") {
+        None => true,
+        Some(repository) => ctx
+            .job_env
+            .get("GITHUB_REPOSITORY")
+            .is_some_and(|own| own.eq_ignore_ascii_case(&repository)),
+    }
+}
+
+/// What to say when a checkout into its own directory asks for a `ref:`,
+/// as `ref: gh-pages` with `path: gh-pages` does: wrkflw copies the working
+/// tree, whatever the ref, so that directory holds this branch's files.
+/// Not said for a checkout into the workspace, whose `ref:` is most often
+/// the commit being run, such as a pull request's head.
+fn checkout_ref_not_honoured(ctx: &StepExecutionContext<'_>) -> Option<String> {
+    if !checks_out_own_repository(ctx) {
+        return None;
+    }
+    let path = checkout_input(ctx, "path")?;
+    let git_ref = checkout_input(ctx, "ref")?;
+    Some(format!(
+        "actions/checkout: ref '{git_ref}' is not checked out locally: '{path}' gets the \
+         working tree wrkflw runs from, as the workspace does"
+    ))
+}
+
 /// Make a path under `workspace` relative, since steps see the workspace under
 /// `/github/workspace` and `github.workspace` is the host path in emulation. The
 /// comparison is by path component, so a sibling like `<workspace>-old` stays
@@ -5820,6 +5968,13 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
     // `toJSON(env)` sees.
     let mut step_env = ctx.job_env.clone();
     let mut step_user_env = ctx.job_user_env.clone();
+    // A `run:` step's env reaches its container, where `${{
+    // github.action_path }}` is the container's path, as in its script.
+    let mut container_lookup = ctx
+        .step
+        .run
+        .as_ref()
+        .and_then(|_| as_the_container_sees_it(&step_env));
 
     // Add step-level environment variables (with secret + expression substitution)
     for (key, value) in &ctx.step.env {
@@ -5839,7 +5994,8 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             value.clone()
         };
         // Resolve ${{ }} expressions in env values (e.g. ${{inputs.toolchain}})
-        let env_expr_ctx = ctx.expr_context_with_env(&step_env, &step_user_env);
+        let lookup = container_lookup.as_ref().unwrap_or(&step_env);
+        let env_expr_ctx = ctx.expr_context_with_env(lookup, &step_user_env);
         let resolved_value = match crate::substitution::preprocess_expressions(
             &resolved_value,
             ctx.working_dir,
@@ -5848,6 +6004,9 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             Ok(r) => r,
             Err(_) => resolved_value,
         };
+        if let Some(lookup) = container_lookup.as_mut() {
+            lookup.insert(key.clone(), resolved_value.clone());
+        }
         step_env.insert(key.clone(), resolved_value.clone());
         step_user_env.insert(key.clone(), resolved_value);
     }
@@ -5879,8 +6038,26 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 ExecutionError::Execution(format!("Failed to get current dir: {}", e))
             })?;
 
-            // Copy the project files to the workspace
-            copy_directory_contents(&current_dir, ctx.working_dir)?;
+            // Copy the project files to the workspace, or to the directory
+            // under it that `path:` names, as go-chi/chi's GOPATH layout does.
+            let destination = match checkout_destination(&ctx) {
+                Ok(destination) => destination,
+                Err(message) => {
+                    return Ok(StepResult::new(step_name, StepStatus::Failure, message));
+                }
+            };
+            std::fs::create_dir_all(&destination).map_err(|e| {
+                ExecutionError::Execution(format!(
+                    "Failed to create checkout path {}: {}",
+                    destination.display(),
+                    e
+                ))
+            })?;
+            crate::checkout_sync::checkout_into(&current_dir, ctx.working_dir, &destination)?;
+            let ref_note = checkout_ref_not_honoured(&ctx);
+            if let Some(note) = &ref_note {
+                wrkflw_logging::warning(note);
+            }
 
             // Add info for logs
             let output = if ctx.verbose {
@@ -5890,8 +6067,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 // Add checkout action details
                 detailed_output.push_str("Checkout Details:\n");
                 detailed_output.push_str("  - Source: Local directory\n");
-                detailed_output
-                    .push_str(&format!("  - Destination: {}\n", ctx.working_dir.display()));
+                detailed_output.push_str(&format!("  - Destination: {}\n", destination.display()));
 
                 // Add a summary count instead of listing all files
                 if let Ok(entries) = std::fs::read_dir(&current_dir) {
@@ -5905,6 +6081,10 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 detailed_output
             } else {
                 "Emulated checkout: Copied current directory to workspace".to_string()
+            };
+            let output = match ref_note {
+                Some(note) => format!("{output}\n{note}\n"),
+                None => output,
             };
 
             if ctx.verbose {
@@ -6589,8 +6769,15 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             run.clone()
         };
 
-        // Resolve expression substitutions (hashFiles, step outputs, env, matrix vars)
-        let run_expr_ctx = ctx.expr_context();
+        // Resolve expression substitutions (hashFiles, step outputs, env, matrix vars).
+        // In a container, `${{ github.action_path }}` is the action's
+        // directory as the container sees it, as $GITHUB_ACTION_PATH is:
+        // lycheeverse/lychee-action runs `${{ github.action_path }}/entrypoint.sh`.
+        let container_env = as_the_container_sees_it(ctx.job_env);
+        let run_expr_ctx = match &container_env {
+            Some(env) => ctx.expr_context_with_env(env, ctx.job_user_env),
+            None => ctx.expr_context(),
+        };
         let resolved_run = match crate::substitution::preprocess_expressions(
             &resolved_run,
             ctx.working_dir,
@@ -6634,7 +6821,12 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 ctx.workflow_defaults
                     .and_then(|d| d.run.as_ref()?.working_directory.as_deref())
             })
-            .map(|wd| resolve_working_directory(wd, &ctx, &step_env, &step_user_env))
+            .map(|wd| {
+                // `${{ github.action_path }}` names the action's directory
+                // as the container sees it, as in the step's `run:`.
+                let lookup = container_lookup.as_ref().unwrap_or(&step_env);
+                resolve_working_directory(wd, &ctx, lookup, &step_user_env)
+            })
             .transpose();
         let effective_wd = match effective_wd {
             Ok(wd) => wd,
@@ -6657,7 +6849,13 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     c => normalized.push(c.as_os_str()),
                 }
             }
-            if !normalized.starts_with(container_workspace) {
+            // A composite action's step may work in the action's own
+            // directory, `${{ github.action_path }}`, as on GitHub: in a
+            // container it is mounted at its own place, outside the
+            // workspace.
+            let in_action_dir = container_lookup.is_some()
+                && normalized.starts_with(crate::job_session::CONTAINER_ACTION_DIR);
+            if !normalized.starts_with(container_workspace) && !in_action_dir {
                 return Ok(StepResult::new(
                     step_name,
                     StepStatus::Failure,
@@ -7037,6 +7235,26 @@ fn prepare_step_container_context(
 }
 
 type VolumePathPair = (PathBuf, PathBuf);
+
+/// `env` as a step in the job's container sees it, for an `env` that names
+/// a composite or JavaScript action's directory and runs in a container:
+/// with $GITHUB_ACTION_PATH where [`prepare_container_mounts`] puts that
+/// directory, so `${{ github.action_path }}` names it too. `None` when
+/// nothing differs.
+fn as_the_container_sees_it(env: &HashMap<String, String>) -> Option<HashMap<String, String>> {
+    if !uses_container_runtime(env) {
+        return None;
+    }
+    let host = env.get("GITHUB_ACTION_PATH")?;
+    let root = crate::node_actions::action_root();
+    let (_, container) = action_mount(Path::new(host), root.as_ref());
+    let mut seen = env.clone();
+    seen.insert(
+        "GITHUB_ACTION_PATH".to_string(),
+        container.to_string_lossy().to_string(),
+    );
+    Some(seen)
+}
 
 /// True when steps execute inside a Docker/Podman/Kubernetes container
 /// rather than on the host. The mode is seeded from the runtime `initialize_runtime`
@@ -7859,9 +8077,16 @@ async fn execute_composite_action(
                     pending_cache_saves,
                 };
 
+                // In a container, `${{ github.action_path }}` is where the
+                // container sees the action, here as in the step's `run:`.
+                let seen = as_the_container_sees_it(step_ctx.job_env);
                 let should_run = match &composite_step.if_condition {
                     Some(cond) => {
-                        evaluate_step_condition(cond, working_dir, &step_ctx.expr_context())
+                        let cond_ctx = match &seen {
+                            Some(env) => step_ctx.expr_context_with_env(env, step_ctx.job_user_env),
+                            None => step_ctx.expr_context(),
+                        };
+                        evaluate_step_condition(cond, working_dir, &cond_ctx)
                     }
                     None => true,
                 };
@@ -8357,6 +8582,18 @@ async fn execute_node_action(
             .unwrap_or_default()
     }) {
         env.insert(name, value);
+    }
+    if js::needs_stand_in_token(&action_info.repository, &env) {
+        wrkflw_logging::info(&format!(
+            "{uses}: no GitHub token for its github-token input, as a local job has none \
+             unless {}=1; it gets a stand-in, so a script that never calls the API runs as \
+             on GitHub, and one that does fails with 401",
+            crate::run_options::JOB_GITHUB_TOKEN_ENV
+        ));
+        env.insert(
+            js::GITHUB_SCRIPT_TOKEN_INPUT.to_string(),
+            js::STAND_IN_TOKEN.to_string(),
+        );
     }
     env.insert(
         "GITHUB_ACTION_PATH".to_string(),
@@ -12566,6 +12803,10 @@ runs:
             built_in.contains("ENV RUSTUP_HOME=/home/runner/.rustup\n"),
             "{built_in}"
         );
+        assert!(
+            built_in.contains("ENV RUSTUP_PERMIT_COPY_RENAME=1\n"),
+            "{built_in}"
+        );
         // Before the install that reads them.
         assert!(
             built_in.find("ENV CARGO_HOME").unwrap() < built_in.find("RUN install-rust").unwrap(),
@@ -12638,6 +12879,36 @@ runs:
         assert_eq!(shared_layers("FROM scratch\n"), "FROM scratch\n");
     }
 
+    /// setup-node's major comes from nodejs.org first: nodesource has no
+    /// package of an end-of-life major, such as 19, for Ubuntu 26.04.
+    #[test]
+    fn a_node_major_comes_from_nodejs_org_before_nodesource() {
+        let install = get_install_script("node", "19");
+        // The new build is run before the runner's Node is touched, and the
+        // runner's npm, corepack and headers go before the copy, so the
+        // other major leaves no files behind.
+        let checked = install
+            .find("node/bin/node --version >/dev/null && ")
+            .unwrap();
+        let cleared = install
+            .find("rm -rf /usr/local/lib/node_modules/npm ")
+            .unwrap();
+        let copied = install.find("cp -a node/. /usr/local/").unwrap();
+        assert!(checked < cleared && cleared < copied, "{install}");
+        assert!(install.contains("/usr/local/include/node && "), "{install}");
+        // The runner image's own install, with no Node to replace, is as it
+        // was: it is part of the image's tag.
+        assert!(!runner_node_install().contains("rm -rf /usr/local/lib"));
+        assert!(
+            install.starts_with("(dir=$(mktemp -d)")
+                && install.contains("https://nodejs.org/dist/latest-v19.x/SHASUMS256.txt")
+                && install.ends_with(&format!("|| ({})", nodesource_install("19"))),
+            "{install}"
+        );
+        // `lts` names no major nodejs.org has a directory for.
+        assert_eq!(get_install_script("node", "lts"), nodesource_install("lts"));
+    }
+
     #[test]
     fn the_runners_node_is_checked_against_its_published_checksum() {
         let install = runner_node_install();
@@ -12656,10 +12927,7 @@ runs:
             "{install}"
         );
         assert!(
-            install.ends_with(&format!(
-                "|| ({}))",
-                get_install_script("node", RUNNER_NODE_MAJOR)
-            )),
+            install.ends_with(&format!("|| ({}))", nodesource_install(RUNNER_NODE_MAJOR))),
             "{install}"
         );
         // One line: it is appended to the shared packages' `RUN`.
@@ -14818,8 +15086,16 @@ runs:
             None,
             RunnerTools::Install,
         );
+        // First, as setup-python's, behind links to the interpreters.
         assert!(
-            df.contains(&format!("ENV PATH={}:", PYTHON_SCRIPTS_DIR)),
+            df.contains(&format!(
+                "ENV PATH={}:{}:",
+                PYTHON_LINKS_DIR, PYTHON_SCRIPTS_DIR
+            )),
+            "{df}"
+        );
+        assert!(
+            df.contains(&format!("ln -sf \"$f\" {}/", PYTHON_LINKS_DIR)),
             "{df}"
         );
         assert!(df.contains(&format!("\" {}", PYTHON_SCRIPTS_DIR)), "{df}");
@@ -15620,6 +15896,158 @@ runs:
         let result = execute_step(ctx).await.unwrap();
         assert_eq!(result.status, StepStatus::Failure);
         assert!(result.output.contains("Invalid working-directory"));
+    }
+
+    /// Calls `f` with the context of an `actions/checkout` step given
+    /// `with`, in a job whose env is `job_env` and workspace `working_dir`.
+    fn with_checkout_ctx<T>(
+        job_env: &HashMap<String, String>,
+        working_dir: &Path,
+        with: &[(&str, &str)],
+        f: impl FnOnce(&StepExecutionContext<'_>) -> T,
+    ) -> T {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let with = with
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect::<HashMap<_, _>>();
+        let step = make_step_uses("actions/checkout@v4", Some(with));
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env,
+            job_user_env: job_env,
+            working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services: test_services(),
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+        };
+        f(&ctx)
+    }
+
+    /// go-chi/chi checks itself out at `${{ env.GOPATH }}/src/github.com/
+    /// ${{ github.repository }}`, with GOPATH the workspace, and runs its
+    /// tests there: the checkout went to the workspace's root instead.
+    #[test]
+    fn checkout_goes_where_its_path_says_inside_the_workspace() {
+        let job_env = HashMap::from([
+            ("GITHUB_WORKSPACE".to_string(), "/host/repo".to_string()),
+            ("GITHUB_REPOSITORY".to_string(), "go-chi/chi".to_string()),
+        ]);
+        let working_dir = PathBuf::from("/host/repo");
+        let destination = |with: &[(&str, &str)]| {
+            with_checkout_ctx(&job_env, &working_dir, with, checkout_destination)
+        };
+        assert_eq!(destination(&[]), Ok(working_dir.clone()));
+        assert_eq!(
+            destination(&[(
+                "path",
+                "${{ github.workspace }}/src/github.com/${{ github.repository }}"
+            )]),
+            Ok(working_dir.join("src/github.com/go-chi/chi"))
+        );
+        assert_eq!(destination(&[("path", "sub")]), Ok(working_dir.join("sub")));
+        // Another repository keeps the old behaviour.
+        assert_eq!(
+            destination(&[("repository", "other/repo"), ("path", "other")]),
+            Ok(working_dir.clone())
+        );
+        assert!(destination(&[("path", "../outside")]).is_err());
+        assert!(destination(&[("path", "/elsewhere")]).is_err());
+    }
+
+    /// `ref: gh-pages` with `path: gh-pages` gets this branch's files, and
+    /// says so; a `ref:` for the workspace, most often the commit being
+    /// run, says nothing.
+    #[test]
+    fn a_checkout_ref_into_its_own_directory_is_said_to_be_ignored() {
+        let job_env = HashMap::from([
+            ("GITHUB_WORKSPACE".to_string(), "/host/repo".to_string()),
+            ("GITHUB_REPOSITORY".to_string(), "o/r".to_string()),
+        ]);
+        let working_dir = PathBuf::from("/host/repo");
+        let note = |with: &[(&str, &str)]| {
+            with_checkout_ctx(&job_env, &working_dir, with, checkout_ref_not_honoured)
+        };
+        let said = note(&[("ref", "gh-pages"), ("path", "gh-pages")]).unwrap();
+        assert!(
+            said.contains("'gh-pages'") && said.contains("not checked out"),
+            "{said}"
+        );
+        assert_eq!(note(&[("ref", "${{ github.sha }}")]), None);
+        assert_eq!(note(&[("path", "sub")]), None);
+        // Another repository's checkout isn't made at all.
+        assert_eq!(
+            note(&[("repository", "x/y"), ("ref", "v1"), ("path", "y")]),
+            None
+        );
+    }
+
+    /// A link in the workspace to a directory outside it is no way out.
+    #[cfg(unix)]
+    #[test]
+    fn checkout_path_through_a_link_out_of_the_workspace_is_refused() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("out")).unwrap();
+        fs::create_dir(workspace.path().join("in")).unwrap();
+        let job_env = HashMap::from([(
+            "GITHUB_WORKSPACE".to_string(),
+            workspace.path().to_string_lossy().to_string(),
+        )]);
+        let working_dir = workspace.path().to_path_buf();
+        let destination = |path: &str| {
+            with_checkout_ctx(
+                &job_env,
+                &working_dir,
+                &[("path", path)],
+                checkout_destination,
+            )
+        };
+        assert!(destination("out/repo").is_err());
+        assert!(destination("out").is_err());
+        assert_eq!(destination("in/repo"), Ok(working_dir.join("in/repo")));
+        assert_eq!(destination("new/repo"), Ok(working_dir.join("new/repo")));
+    }
+
+    /// A workspace that exists but can't be resolved can't be checked for
+    /// links, so a `path:` into it is refused; one not made yet holds none.
+    #[cfg(unix)]
+    #[test]
+    fn checkout_path_into_an_unresolvable_workspace_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let working_dir = parent.path().join("ws");
+        fs::create_dir(&working_dir).unwrap();
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads through any mode: nothing to test there.
+        let unresolvable = working_dir.canonicalize().is_err();
+        let job_env = HashMap::new();
+        let refused = with_checkout_ctx(&job_env, &working_dir, &[("path", "sub")], |ctx| {
+            checkout_destination(ctx)
+        });
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        if unresolvable {
+            let message = refused.unwrap_err();
+            assert!(message.contains("can't check"), "{message}");
+        }
+        let missing = parent.path().join("not-yet");
+        let made_later = with_checkout_ctx(&job_env, &missing, &[("path", "sub")], |ctx| {
+            checkout_destination(ctx)
+        });
+        assert_eq!(made_later, Ok(missing.join("sub")));
     }
 
     #[tokio::test]
@@ -18362,6 +18790,113 @@ runs:
             .volumes
             .iter()
             .any(|(host, guest)| host == &expected_host && guest == Path::new("/github/action")));
+    }
+
+    /// `${{ github.action_path }}` in a composite's `run:` names the
+    /// directory as the container sees it, not the host's, as
+    /// lycheeverse/lychee-action's `${{ github.action_path }}/entrypoint.sh`
+    /// needs.
+    #[tokio::test]
+    async fn composite_run_sees_github_action_path_inside_the_container() {
+        let action_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            action_dir.path().join("action.yml"),
+            r#"
+name: test action
+runs:
+  using: composite
+  steps:
+    - run: ${{ github.action_path }}/entrypoint.sh "$CONFIG"
+      shell: bash
+      if: startsWith(github.action_path, '/github/action')
+      working-directory: ${{ github.action_path }}
+      env:
+        CONFIG: ${{ github.action_path }}/config.toml
+"#,
+        )
+        .unwrap();
+
+        let runtime = MockContainerRuntime::default();
+        let mut job_env = HashMap::new();
+        job_env.insert("WRKFLW_RUNTIME_MODE".to_string(), "docker".to_string());
+        let working_dir = tempfile::tempdir().unwrap();
+        let step = make_run_step("noop");
+        let services = test_services();
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+
+        execute_composite_action(
+            &step,
+            action_dir.path(),
+            &job_env,
+            &job_env,
+            working_dir.path(),
+            &runtime,
+            "ubuntu:latest",
+            &BuiltRuntimes::default(),
+            false,
+            &services,
+            &pending,
+        )
+        .await
+        .unwrap();
+
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let command = format!(
+            "{} {}",
+            calls[0].cmd.join(" "),
+            calls[0].script.clone().unwrap_or_default()
+        );
+        assert!(
+            command.contains("/github/action/entrypoint.sh"),
+            "{command}"
+        );
+        let host = action_dir.path().canonicalize().unwrap();
+        assert!(!command.contains(&*host.to_string_lossy()), "{command}");
+        // Its `if:` saw that path, and its `working-directory:` is there.
+        assert_eq!(calls[0].working_dir, Path::new("/github/action"));
+        // The step's `env:` reaches the container too.
+        let config = calls[0]
+            .env_vars
+            .iter()
+            .find(|(key, _)| key == "CONFIG")
+            .map(|(_, value)| value.as_str());
+        assert_eq!(config, Some("/github/action/config.toml"), "{calls:?}");
+    }
+
+    #[test]
+    fn a_job_that_failed_only_at_its_end_was_measured_whole() {
+        let step = |status| StepResult::new("s".to_string(), status, String::new());
+        use StepStatus::{Failure, Skipped, Success};
+        // execa: tests passed, the coverage upload at the end failed.
+        assert!(failed_at_its_last_step(
+            &[step(Success), step(Success), step(Failure)],
+            3
+        ));
+        // A step skipped by its own `if:` before the failure is no matter.
+        assert!(failed_at_its_last_step(
+            &[step(Skipped), step(Success), step(Failure)],
+            3
+        ));
+        // Stopped part way: the loop records nothing after the failure, so
+        // the job's own step count is what tells.
+        assert!(!failed_at_its_last_step(&[step(Success), step(Failure)], 4));
+        // A post that failed after every step ran.
+        assert!(failed_at_its_last_step(
+            &[step(Success), step(Success), step(Failure)],
+            2
+        ));
+        // A failure `continue-on-error` allowed concludes as a success.
+        let mut allowed = step(Failure);
+        allowed.conclusion = Success;
+        assert!(failed_at_its_last_step(
+            &[allowed, step(Success), step(Failure)],
+            3
+        ));
+        // Nothing failed, so nothing to say for a failed job, as when its
+        // setup failed or it called a reusable workflow.
+        assert!(!failed_at_its_last_step(&[step(Success)], 1));
+        assert!(!failed_at_its_last_step(&[], 0));
     }
 
     // --- Composite step if-condition tests ---

@@ -16,8 +16,10 @@
 //! reports a process killed by SIGKILL, as cargo and compilers do for the
 //! `rustc` or `ld` the kernel picked, and a shell does as `Killed`.
 //!
-//! Only a job that ran to the end and passed records a peak: one that
-//! failed or was cancelled part way used less than a whole run does. A job
+//! Only a job that ran to its end records a peak: one that passed, or
+//! failed only at its last step, as when only a coverage upload at the end
+//! failed. One stopped or cancelled part way used less than a whole run
+//! does. A job
 //! whose containers couldn't all be measured, as with Podman, forgets what
 //! an earlier run measured, which no longer says what it needs.
 //!
@@ -242,11 +244,12 @@ impl Drop for Active {
 /// Run `future`, one job or matrix leg, with a meter of its own, and keep
 /// what it measured if the job named itself with [`measure_as`] and the run
 /// sizes jobs by memory: a run that doesn't would never read it back.
-/// `succeeded` says whether the output is a job that passed. A future that
-/// is dropped before it finishes keeps nothing.
+/// `ran_to_its_end` says whether the output is a job that ran to its end,
+/// so its peak covers its heaviest step. A future that is dropped before it
+/// finishes keeps nothing.
 pub(crate) async fn metered<F: std::future::Future>(
     future: F,
-    succeeded: impl FnOnce(&F::Output) -> bool,
+    ran_to_its_end: impl FnOnce(&F::Output) -> bool,
 ) -> F::Output {
     let meter = Arc::new(JobMeter::default());
     // Gives the place up even when this future is dropped part way, not
@@ -258,7 +261,7 @@ pub(crate) async fn metered<F: std::future::Future>(
     let id = meter.id.lock().unwrap_or_else(|e| e.into_inner()).take();
     let leg = meter.leg.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(id) = id.filter(|_| crate::vm_memory::sizes_by_memory()) {
-        let passed = succeeded(&output);
+        let whole = ran_to_its_end(&output);
         // A leg its siblings sized that was killed is a failure a run on
         // GitHub wouldn't have: say why, and that the next run won't.
         let misjudged =
@@ -267,7 +270,7 @@ pub(crate) async fn metered<F: std::future::Future>(
         let family = leg.as_ref().map(|leg| leg.family.clone());
         // The store is a file under a lock: not for the async runtime.
         let changed =
-            tokio::task::spawn_blocking(move || record(&id, family.as_deref(), &measured, passed))
+            tokio::task::spawn_blocking(move || record(&id, family.as_deref(), &measured, whole))
                 .await
                 .unwrap_or(false);
         // Before the place is given up: a sibling waiting for the whole VM
@@ -448,8 +451,9 @@ impl Default for Store {
 struct Measured {
     /// Latest peaks, newest last.
     peaks: Vec<u64>,
-    /// The highest peak of any passing run since the job was first measured,
-    /// or since it last ran out of memory, which forgets it all.
+    /// The highest peak of any run measured to its end since the job was
+    /// first measured, or since it last ran out of memory, which forgets it
+    /// all.
     #[serde(default)]
     highest: u64,
     /// For a matrix: a process was killed for lack of memory while a leg
@@ -606,13 +610,12 @@ fn keep(
 }
 
 /// Keep what `meter` saw of the job `id`, a leg of the matrix `family` if
-/// any, which ran to its end and `passed` or not. `true` when the store
-/// was changed.
-fn record(id: &str, family: Option<&str>, meter: &JobMeter, passed: bool) -> bool {
+/// any, `whole` when it ran to its end. `true` when the store was changed.
+fn record(id: &str, family: Option<&str>, meter: &JobMeter, whole: bool) -> bool {
     let Some(path) = store_path() else {
         return false;
     };
-    let Some(outcome) = to_keep(meter.outcome(), passed) else {
+    let Some(outcome) = to_keep(meter.outcome(), whole) else {
         return false;
     };
     let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -654,11 +657,12 @@ fn record(id: &str, family: Option<&str>, meter: &JobMeter, passed: bool) -> boo
     written.is_ok()
 }
 
-/// What to keep of a finished job's `outcome`. A failed job may have
-/// stopped before its heaviest step, so its peak says nothing.
-fn to_keep(outcome: Outcome, passed: bool) -> Option<Outcome> {
+/// What to keep of a finished job's `outcome`. `whole` is false for a job
+/// that stopped part way, which may not have reached its heaviest step, so
+/// its peak says nothing.
+fn to_keep(outcome: Outcome, whole: bool) -> Option<Outcome> {
     match outcome {
-        Outcome::Peak(_) if !passed => None,
+        Outcome::Peak(_) if !whole => None,
         outcome => Some(outcome),
     }
 }
@@ -870,7 +874,7 @@ mod tests {
         apply(&mut store, "job", Outcome::Peak(MIB), 1000);
         apply(&mut store, "job", Outcome::Unknown, 1000);
         assert!(!store.jobs.contains_key("job"));
-        // Only a job that passed keeps its peak.
+        // Only a job that ran to its end keeps its peak.
         assert_eq!(to_keep(Outcome::Peak(MIB), false), None);
         assert_eq!(to_keep(Outcome::Peak(MIB), true), Some(Outcome::Peak(MIB)));
         assert_eq!(to_keep(Outcome::Killed, false), Some(Outcome::Killed));

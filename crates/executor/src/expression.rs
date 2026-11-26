@@ -1312,6 +1312,23 @@ pub fn text_reads_context(text: &str, context: &str) -> bool {
 /// fills in a job's `name:` or `runs-on:` for one matrix leg. `None` when an
 /// expression reads another context, such as `needs`, or is empty.
 pub fn evaluate_matrix_text(text: &str, matrix: Option<&HashMap<String, Value>>) -> Option<String> {
+    matrix_text(text, matrix, false)
+}
+
+/// [`evaluate_matrix_text`] for a job's `name:`, where GitHub writes an
+/// empty or missing value as nothing: a leg that lacks `redis` is
+/// `Test Python 3.10, Redis` for `Test Python ${{ matrix.python }}, Redis
+/// ${{ matrix.redis }}`. `None` only when an expression reads another
+/// context or doesn't evaluate.
+pub fn evaluate_matrix_name(text: &str, matrix: Option<&HashMap<String, Value>>) -> Option<String> {
+    matrix_text(text, matrix, true)
+}
+
+fn matrix_text(
+    text: &str,
+    matrix: Option<&HashMap<String, Value>>,
+    empty_is_nothing: bool,
+) -> Option<String> {
     static EXPR: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r"\$\{\{(.*?)\}\}").unwrap());
     if !text.contains("${{") {
@@ -1351,6 +1368,7 @@ pub fn evaluate_matrix_text(text: &str, matrix: Option<&HashMap<String, Value>>)
             ExprValue::String(s) if !s.is_empty() => s,
             ExprValue::Number(n) => n.to_string(),
             ExprValue::Bool(b) => b.to_string(),
+            ExprValue::String(_) | ExprValue::Null if empty_is_nothing => String::new(),
             _ => return None,
         };
         resolved.push_str(&text[last..whole.start()]);

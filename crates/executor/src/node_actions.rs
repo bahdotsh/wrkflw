@@ -138,6 +138,26 @@ pub(crate) fn input_env(
     env
 }
 
+/// `actions/github-script`'s token input, as its code reads it.
+pub(crate) const GITHUB_SCRIPT_TOKEN_INPUT: &str = "INPUT_GITHUB-TOKEN";
+
+/// What `actions/github-script` gets for its token when the job has none.
+/// Not a token: the API refuses it, as it would refuse a bad one.
+pub(crate) const STAND_IN_TOKEN: &str = "wrkflw-no-github-token";
+
+/// Whether `actions/github-script` would stop before running its script.
+/// It refuses an empty `github-token`, which defaults to the token every
+/// GitHub job has and a local job lacks unless asked: actions such as
+/// `codecov/codecov-action` call it with a script that never reaches the
+/// API, and failed only for that. A stand-in lets the script run; one that
+/// calls the API then fails there, as without a token it would anyway.
+pub(crate) fn needs_stand_in_token(repository: &str, env: &HashMap<String, String>) -> bool {
+    repository.eq_ignore_ascii_case("actions/github-script")
+        && env
+            .get(GITHUB_SCRIPT_TOKEN_INPUT)
+            .is_none_or(|token| token.trim().is_empty())
+}
+
 /// The `bash` command that runs `script` from the action's directory, for
 /// an action that asks for Node `major`. The script's path is quoted, so
 /// whatever its name holds reaches `node` as written. When the image's
@@ -882,5 +902,22 @@ mod tests {
         // What one job writes there, the other doesn't see.
         std::fs::write(copied.join("node_modules"), "x").unwrap();
         assert!(!b.path().join("action/node_modules").exists());
+    }
+
+    #[test]
+    fn github_script_gets_a_stand_in_only_without_a_token() {
+        let with = |token: &str| {
+            HashMap::from([(GITHUB_SCRIPT_TOKEN_INPUT.to_string(), token.to_string())])
+        };
+        assert!(needs_stand_in_token("actions/github-script", &with("")));
+        assert!(needs_stand_in_token(
+            "Actions/GitHub-Script",
+            &HashMap::new()
+        ));
+        assert!(!needs_stand_in_token(
+            "actions/github-script",
+            &with("ghs_real")
+        ));
+        assert!(!needs_stand_in_token("someone/other-action", &with("")));
     }
 }

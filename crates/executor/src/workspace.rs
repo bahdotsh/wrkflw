@@ -251,14 +251,51 @@ impl JobWorkspace {
     }
 }
 
-/// Where checkout records what git tracked at the last sync of the kept
-/// workspace `workspace`, or `None` when it isn't a kept one. The record
-/// sits beside the workspace, as its lock does, so the job can't change it.
-pub(crate) fn tracked_record(workspace: &Path) -> Option<PathBuf> {
-    workspace
-        .with_extension("lock")
-        .is_file()
-        .then(|| workspace.with_extension("tracked"))
+/// Where checkout records what git tracked at the last sync into
+/// `destination`, the kept workspace `workspace` or a directory under it
+/// that a checkout's `path:` names, or `None` when the workspace isn't a
+/// kept one. The record sits beside the workspace, as its lock does, so the
+/// job can't change it. Each destination has its own: a second checkout in
+/// the same run must still compare with what its directory last got, not
+/// with what the first one just recorded.
+pub(crate) fn tracked_record(workspace: &Path, destination: &Path) -> Option<PathBuf> {
+    if !workspace.with_extension("lock").is_file() {
+        return None;
+    }
+    let under = destination.strip_prefix(workspace).ok()?;
+    if under.as_os_str().is_empty() {
+        return Some(workspace.with_extension(TRACKED_EXTENSION));
+    }
+    Some(workspace.with_extension(format!(
+        "{TRACKED_EXTENSION}-{:012x}",
+        short_hash(&under.to_string_lossy())
+    )))
+}
+
+/// The extension of a workspace's tracked-files records, which
+/// [`tracked_record`] names `<workspace>.tracked` and
+/// `<workspace>.tracked-<hash>`.
+const TRACKED_EXTENSION: &str = "tracked";
+
+/// Remove every tracked-files record of `workspace`.
+fn remove_tracked_records(workspace: &Path) {
+    let (Some(parent), Some(name)) = (workspace.parent(), workspace.file_name()) else {
+        return;
+    };
+    let prefix = format!("{}.{TRACKED_EXTENSION}", name.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file = entry.file_name();
+        let file = file.to_string_lossy();
+        let Some(rest) = file.strip_prefix(&prefix) else {
+            continue;
+        };
+        if rest.is_empty() || rest.starts_with('-') || rest.starts_with('.') {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Env var that moves kept workspaces out of the cache directory.
@@ -390,7 +427,7 @@ fn clean_under(root: &Path) -> std::io::Result<CleanReport> {
                     report.bytes += bytes;
                     // The record describes the files just removed. Held
                     // under the lock, so no run is about to read it.
-                    let _ = std::fs::remove_file(dir.with_extension("tracked"));
+                    remove_tracked_records(&dir);
                 }
                 // Part of it may be gone; what is left is counted next time.
                 Err(e) => report.failed.push((dir, e.to_string())),
@@ -659,10 +696,14 @@ mod tests {
         let free_path = free.path().to_path_buf();
         std::fs::write(free_path.join("out.o"), "built").unwrap();
         assert_eq!(
-            tracked_record(&free_path),
+            tracked_record(&free_path, &free_path),
             Some(free_path.with_extension("tracked"))
         );
         std::fs::write(free_path.with_extension("tracked"), "out.o\0").unwrap();
+        // A `path:` checkout's record goes too.
+        let sub = tracked_record(&free_path, &free_path.join("src/github.com/x/y")).unwrap();
+        assert_ne!(sub, free_path.with_extension("tracked"));
+        std::fs::write(&sub, "out.o\0").unwrap();
         drop(free);
         let held = JobWorkspace::keep(root.path(), repo.path(), Path::new(CI), "CI", "test")
             .unwrap()
@@ -681,6 +722,7 @@ mod tests {
         );
         assert!(!free_path.exists());
         assert!(!free_path.with_extension("tracked").exists());
+        assert!(!sub.exists());
         assert!(held.path().is_dir());
 
         // The cleaned workspace comes back, empty, on the next run.

@@ -1,5 +1,13 @@
 name: Release
 
+# A tag with a suffix, such as v0.9.0-rc.1, is a rehearsal: it builds the
+# archives, publishes the runner base image and makes a GitHub pre-release,
+# and leaves crates.io alone. Use one to try scripts/install.sh
+# (WRKFLW_VERSION=v0.9.0-rc.1) and to make a new runner image's package
+# public before the release that needs it. A rehearsal only warns about a
+# private package, so once it is public, rerun its "Publish the runner base
+# image" job and see it pass with no warning: that is the check a release
+# stops on, and the rehearsal is the only place it runs before one.
 on:
   push:
     tags:
@@ -111,8 +119,10 @@ jobs:
             --push .
       # GHCR makes a new package private. wrkflw pulls the base without
       # credentials and builds the whole image itself when it can't, so a
-      # private package fails nothing; it only takes away the faster first
-      # run. Say so, rather than fail the release.
+      # private package breaks no run: it takes away the faster first run,
+      # silently, on every machine. So a release stops here, before anything
+      # is published, until the package is public (rerun this job then); a
+      # rehearsal only says so, as it is how the package first appears.
       - name: Check the image can be pulled anonymously
         env:
           IMAGE: ${{ steps.image.outputs.name }}
@@ -120,13 +130,36 @@ jobs:
           ref="${IMAGE#ghcr.io/}"
           name="${ref%%:*}"
           tag="${ref##*:}"
-          token=$(curl -fsS "https://ghcr.io/token?scope=repository:${name}:pull" | jq -r .token)
-          if ! curl -fsS -o /dev/null \
-              -H "Authorization: Bearer ${token}" \
-              -H "Accept: application/vnd.oci.image.index.v1+json" \
-              "https://ghcr.io/v2/${name}/manifests/${tag}"; then
-            echo "::warning::${IMAGE} can't be pulled anonymously: make the package public in its settings, or wrkflw builds the image on each machine"
+          # Only a refusal says the package is private, and it comes from
+          # either request: GHCR refuses an anonymous token for a private
+          # package (403) before the manifest is asked for. Anything else,
+          # such as a network error or a 5xx left after curl's retries, says
+          # nothing about it, and asks for a rerun.
+          body=$(mktemp)
+          status=$(curl -sS --retry 3 --retry-connrefused -o "$body" -w '%{http_code}' \
+            "https://ghcr.io/token?scope=repository:${name}:pull") || status=000
+          if [ "$status" = 200 ]; then
+            if token=$(jq -er .token "$body"); then
+              status=$(curl -sS --retry 3 --retry-connrefused -o /dev/null -w '%{http_code}' \
+                -H "Authorization: Bearer ${token}" \
+                -H "Accept: application/vnd.oci.image.index.v1+json" \
+                "https://ghcr.io/v2/${name}/manifests/${tag}") || status=000
+            else
+              status=000
+            fi
           fi
+          case "$status" in
+            200) exit 0 ;;
+            401|403) message="${IMAGE} can't be pulled anonymously: make the package public in its settings, or wrkflw builds the image on each machine" ;;
+            # GHCR answers 404 for a private package's manifest, and for a
+            # tag that was never pushed: say both.
+            404) message="${IMAGE} wasn't found anonymously: make the package public in its settings, or check the tag was pushed by the step above" ;;
+            *) message="couldn't tell whether ${IMAGE} can be pulled anonymously (HTTP ${status}): rerun this job" ;;
+          esac
+          case "$RELEASE_TAG" in
+            *-*) echo "::warning::${message}" ;;
+            *) echo "::error::${message}"; exit 1 ;;
+          esac
 
   build:
     name: Build (${{ matrix.target }})
@@ -198,8 +231,9 @@ jobs:
     # After the runner base image: a published wrkflw pulls it on first run.
     needs: [build, changelog, runner-image]
     # Only publish on tag push — manual dispatch uses a branch ref, intentionally excluded
-    # because publishing to crates.io is irreversible
-    if: startsWith(github.ref, 'refs/tags/v')
+    # because publishing to crates.io is irreversible. A rehearsal tag
+    # (v0.9.0-rc.1) publishes nothing there either.
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -246,4 +280,7 @@ jobs:
             ## What's Changed
             ${{ needs.changelog.outputs.changelog }}
           files: artifacts/*
+          # A rehearsal tag is a pre-release, which "latest" skips: install.sh
+          # and the weekly runner image refresh keep using the last release.
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           generate_release_notes: false

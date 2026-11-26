@@ -48,14 +48,29 @@ fn create_gitignore_matcher(
     }
 }
 
-/// Bring `to` up to date with the source files in `from`, as a checkout does.
+/// [`checkout_into`] the workspace `to` itself.
+#[cfg(test)]
+pub(crate) fn copy_directory_contents(from: &Path, to: &Path) -> Result<(), ExecutionError> {
+    checkout_into(from, to, to)
+}
+
+/// Bring `to`, the job's workspace `workspace` or a directory under it that
+/// a checkout's `path:` names, up to date with the source files in `from`,
+/// as a checkout does.
 ///
 /// Job workspaces are kept between runs, so this syncs rather than copies:
 /// unchanged files are left alone with their timestamps, which keeps build
 /// tools from rebuilding them; changed files are copied with the source's
 /// timestamp; and source files deleted since the last run are removed. What
 /// the repository ignores (build output, dependencies) is never touched.
-pub(crate) fn copy_directory_contents(from: &Path, to: &Path) -> Result<(), ExecutionError> {
+///
+/// What is kept beside a workspace, and what the sync must never copy into
+/// itself, are the workspace's, not the destination's.
+pub(crate) fn checkout_into(
+    from: &Path,
+    workspace: &Path,
+    to: &Path,
+) -> Result<(), ExecutionError> {
     // Walk the source by its real path, so the workspace can be recognised
     // when it sits inside it.
     let from = from.canonicalize().unwrap_or_else(|_| from.to_path_buf());
@@ -66,7 +81,7 @@ pub(crate) fn copy_directory_contents(from: &Path, to: &Path) -> Result<(), Exec
             return Ok(());
         }
     }
-    let rules = SyncRules::for_root(from, to)?;
+    let rules = SyncRules::for_root(from, workspace, to)?;
     copy_directory_contents_with_gitignore(from, to, &rules, &[], false)?;
     // A checkout is a git repository, and steps run `git describe`, `git
     // diff` and the like. Without one they fail here and pass on GitHub, and
@@ -483,7 +498,7 @@ impl Tracked {
 }
 
 impl SyncRules {
-    fn for_root(root: &Path, workspace: &Path) -> Result<Self, ExecutionError> {
+    fn for_root(root: &Path, workspace: &Path, to: &Path) -> Result<Self, ExecutionError> {
         let mut never: Vec<PathBuf> = [
             Some(workspace.to_path_buf()),
             crate::workspace::workspaces_root(),
@@ -501,7 +516,7 @@ impl SyncRules {
         // workspace's `.git`, which the job's steps can rewrite. Only worth
         // reading where the source's own index could be read: otherwise
         // nothing compares it with what is tracked now.
-        let record_path = crate::workspace::tracked_record(workspace);
+        let record_path = crate::workspace::tracked_record(workspace, to);
         let previously_tracked = match (&tracked, &record_path) {
             (Some(_), Some(path)) => std::fs::read_to_string(path)
                 .ok()
@@ -529,7 +544,11 @@ impl SyncRules {
         };
         let written = match listing {
             Some(listing) => {
-                let partial = path.with_extension("tracked.partial");
+                // Beside the record, under a name of its own: each
+                // destination's record has its own partial file.
+                let mut partial = path.clone().into_os_string();
+                partial.push(".partial");
+                let partial = PathBuf::from(partial);
                 std::fs::write(&partial, listing).and_then(|()| std::fs::rename(&partial, path))
             }
             None => match std::fs::remove_file(path) {
@@ -1402,6 +1421,43 @@ mod tests {
         assert!(dst.as_path().join(".pytest_cache").is_dir());
         // What was tracked came from wrkflw's record, not the workspace.
         assert!(dst.with_extension("tracked").is_file());
+    }
+
+    /// A checkout's `path:` puts the repository under the workspace: its
+    /// record is kept beside the workspace, and is its own, so a second
+    /// such checkout in the same run still removes what the repository
+    /// deleted, after the first recorded the new listing.
+    #[test]
+    fn a_checkout_under_the_workspace_keeps_a_record_of_its_own() {
+        let Some(src) = git_repo() else {
+            return;
+        };
+        let (_parent, ws) = kept_workspace();
+        let first = ws.join("src/github.com/o/r");
+        let second = ws.join("other");
+        std::fs::write(src.path().join(".npmrc"), "x").unwrap();
+        std::fs::write(src.path().join("lib.rs"), "").unwrap();
+        assert!(git(src.path(), &["add", "."]));
+        assert!(git(src.path(), &["commit", "-qm", "one"]));
+        let both = || {
+            for to in [&first, &second] {
+                std::fs::create_dir_all(to).unwrap();
+                checkout_into(src.path(), &ws, to).unwrap();
+            }
+        };
+        both();
+        assert!(first.join(".npmrc").is_file());
+        assert!(second.join(".npmrc").is_file());
+        // Nothing is written into the workspace, nor beside a destination.
+        assert!(!first.with_extension("tracked").exists());
+        assert!(!ws.with_extension("tracked").exists());
+
+        assert!(git(src.path(), &["rm", "-q", ".npmrc"]));
+        assert!(git(src.path(), &["commit", "-qm", "two"]));
+        both();
+        assert!(!first.join(".npmrc").exists());
+        assert!(!second.join(".npmrc").exists());
+        assert!(second.join("lib.rs").is_file());
     }
 
     #[test]

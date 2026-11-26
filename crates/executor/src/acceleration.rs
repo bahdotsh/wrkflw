@@ -330,7 +330,7 @@ fn grants_write(permissions: &serde_yaml::Value) -> bool {
 /// A job and workflow with no `permissions:` count as read-only here, though
 /// on GitHub that means the repository's default, which is write-all on
 /// repositories created before February 2023. Treating that as a write would
-/// rule out nearly every job. The README asks for `cache: false` instead.
+/// rule out nearly every job. docs/usage.md asks for `cache: false` instead.
 pub(crate) fn uncacheable_reason(
     job: &Job,
     workflow: &WorkflowDefinition,

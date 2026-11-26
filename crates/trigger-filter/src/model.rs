@@ -278,26 +278,68 @@ fn expand_inner_double_stars(source: &str) -> Result<Vec<String>, PatternError> 
     Ok(expanded)
 }
 
-/// `component` split at each run of two or more `*`, all of which GitHub
-/// takes as `**`, or `None` when it has none or is `**` alone, which `glob`
-/// takes itself.
+/// `component` split at each run of two or more `*` outside a `[...]`
+/// class, all of which GitHub takes as `**`, or `None` when it has none or
+/// is `**` alone, which `glob` takes itself. A `*` inside a class is a
+/// literal character and stays where it is.
 fn inner_double_star_pieces(component: &str) -> Option<Vec<&str>> {
-    if component == "**" || !component.contains("**") {
+    if component == "**" {
         return None;
     }
+    let runs = star_runs(component);
     let mut pieces = Vec::new();
-    let mut rest = component;
-    while let Some(at) = rest.find("**") {
-        pieces.push(&rest[..at]);
-        rest = rest[at..].trim_start_matches('*');
+    let mut start = 0;
+    for (at, end) in runs.into_iter().filter(|(at, end)| end - at >= 2) {
+        pieces.push(&component[start..at]);
+        start = end;
     }
-    pieces.push(rest);
+    if pieces.is_empty() {
+        return None;
+    }
+    pieces.push(&component[start..]);
     Some(pieces)
 }
 
-/// `source` with each run of `*` inside a component written `*?..`, of the
-/// same length, which `glob` accepts: what is left to refuse is the rest of
-/// the pattern, at the position it has in `source`.
+/// The byte ranges of each run of `*` in `component` outside a `[...]`
+/// class, read as `glob` reads a class: a `]` right after `[` or `[!` is a
+/// member, not the end, and a `[` with no `]` to close it is left for
+/// `glob` to refuse.
+fn star_runs(component: &str) -> Vec<(usize, usize)> {
+    let bytes = component.as_bytes();
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'[' => {
+                let mut j = i + 1;
+                if bytes.get(j) == Some(&b'!') {
+                    j += 1;
+                }
+                if bytes.get(j) == Some(&b']') {
+                    j += 1;
+                }
+                match bytes[j.min(bytes.len())..].iter().position(|&b| b == b']') {
+                    Some(close) => i = j + close + 1,
+                    None => i += 1,
+                }
+            }
+            b'*' => {
+                let start = i;
+                while bytes.get(i) == Some(&b'*') {
+                    i += 1;
+                }
+                runs.push((start, i));
+            }
+            _ => i += 1,
+        }
+    }
+    runs
+}
+
+/// `source` with each run of `*` outside a class, in a component that has
+/// `**` inside it, written `*?..`, of the same length, which `glob`
+/// accepts: what is left to refuse is the rest of the pattern, at the
+/// position it has in `source`.
 fn same_length_check(source: &str) -> String {
     source
         .split('/')
@@ -305,21 +347,11 @@ fn same_length_check(source: &str) -> String {
             if inner_double_star_pieces(component).is_none() {
                 return component.to_string();
             }
-            let mut out = String::with_capacity(component.len());
-            let mut stars = 0;
-            for c in component.chars().chain(std::iter::once('\0')) {
-                if c == '*' {
-                    stars += 1;
-                    continue;
-                }
-                if stars > 0 {
-                    out.push('*');
-                    out.extend(std::iter::repeat_n('?', stars - 1));
-                    stars = 0;
-                }
-                if c != '\0' {
-                    out.push(c);
-                }
+            let mut out = component.to_string();
+            // Same length, so each run's position holds after the last.
+            for (at, end) in star_runs(component) {
+                let run = format!("*{}", "?".repeat(end - at - 1));
+                out.replace_range(at..end, &run);
             }
             out
         })
@@ -504,6 +536,25 @@ mod glob_pattern_tests {
         // Two in one component count twice toward the limit.
         assert!(GlobPattern::new("a**b**/c**d**").is_ok());
         assert!(GlobPattern::new("a**b**c/d**e**f/g**").is_err());
+    }
+
+    /// `*` inside a `[...]` class is a literal character, so `**` there is
+    /// no wildcard and the component is left as written.
+    #[test]
+    fn stars_inside_a_class_are_not_split() {
+        let class = GlobPattern::new("[**]x").unwrap();
+        assert!(class.matches("*x"));
+        assert!(!class.matches("ax"));
+        assert!(!class.matches("a/x"));
+        // `]` first in a class is a member, so the class runs on past it.
+        let bracket = GlobPattern::new("[]**]x").unwrap();
+        assert!(bracket.matches("]x"));
+        assert!(bracket.matches("*x"));
+        // A real `**` beside a class still crosses directories.
+        let mixed = GlobPattern::new("[ab]**.go").unwrap();
+        assert!(mixed.matches("a.go"));
+        assert!(mixed.matches("b/c/d.go"));
+        assert!(!mixed.matches("c.go"));
     }
 
     #[test]

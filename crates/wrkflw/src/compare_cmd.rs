@@ -383,22 +383,33 @@ fn lacked_service_token(failure: &Value) -> bool {
 }
 
 /// What a step prints when it runs an x86_64 program, as `cross` does, in
-/// an arm64 job container, such as one on an Apple Silicon Mac.
-const NEEDS_X86_64: &[&str] = &[
-    "rosetta error: failed to open elf at /lib64/ld-linux-x86-64.so.2",
-    "toolchain add stable-x86_64-unknown-linux-gnu",
-];
+/// an arm64 job container on an Apple Silicon Mac. Only Rosetta prints it,
+/// so it says so on any build of wrkflw.
+const ROSETTA_NEEDS_X86_64: &str =
+    "rosetta error: failed to open elf at /lib64/ld-linux-x86-64.so.2";
 
-/// Whether this machine's job containers are arm64, where an x86_64
-/// program can't run: only there does [`needed_x86_64`] explain a failure.
-/// The same rustup line on an x86_64 machine, such as a download that
-/// failed, has a cause of its own.
+/// What `cross` prints when it can't add the x86_64 toolchain it needs. On
+/// an x86_64 machine the same line has a cause of its own, such as a
+/// download that failed, so it counts only where [`HOST_IS_ARM64`].
+const RUSTUP_NEEDS_X86_64: &str = "toolchain add stable-x86_64-unknown-linux-gnu";
+
+/// Whether job containers here are arm64, judged by the architecture wrkflw
+/// was built for. An approximation: the run's report doesn't record the
+/// container's, and an x86_64 build under Rosetta, a remote Docker host or
+/// a cluster may differ. It decides only whether a note is added.
 const HOST_IS_ARM64: bool = cfg!(target_arch = "aarch64");
 
-/// Whether a failed step's output shows it needed an x86_64 machine.
-fn needed_x86_64(failure: &Value) -> bool {
-    failure_lines(failure).any(|line| NEEDS_X86_64.iter().any(|sign| line.contains(sign)))
+/// Whether a failed step's output shows it needed an x86_64 machine, on a
+/// machine whose job containers are arm64 when `host_is_arm64`.
+fn needed_x86_64(failure: &Value, host_is_arm64: bool) -> bool {
+    failure_lines(failure).any(|line| {
+        line.contains(ROSETTA_NEEDS_X86_64) || (host_is_arm64 && line.contains(RUSTUP_NEEDS_X86_64))
+    })
 }
+
+/// The note added when a step needed an x86_64 machine.
+const NEEDS_X86_64_NOTE: &str = "a step ran an x86_64 program, as `cross` does, which this \
+     machine's arm64 job container can't run; GitHub's runner is x86_64";
 
 /// The most a note quotes of a line of a step's output.
 const QUOTED_LINE_CHARS: usize = 200;
@@ -493,15 +504,10 @@ fn note_for(local: &Value, failures: &[Value], runs_docker: bool) -> Option<Stri
     }
     // GitHub's `ubuntu-*` runners are x86_64; a job container on an arm64
     // machine is arm64, and `cross` and its images are x86_64 only.
-    if HOST_IS_ARM64
-        && local["status"] == "failure"
-        && failures_of(failures, name).any(needed_x86_64)
+    if local["status"] == "failure"
+        && failures_of(failures, name).any(|failure| needed_x86_64(failure, HOST_IS_ARM64))
     {
-        notes.push(
-            "a step ran an x86_64 program, as `cross` does, which this machine's arm64 \
-             job container can't run; GitHub's runner is x86_64"
-                .to_string(),
-        );
+        notes.push(NEEDS_X86_64_NOTE.to_string());
     }
     for action in local["actions_not_run"].as_array().into_iter().flatten() {
         notes.push(format!(
@@ -2413,19 +2419,26 @@ mod tests {
                 .clone()
                 .unwrap_or_default()
         };
-        for line in [
-            "rosetta error: failed to open elf at /lib64/ld-linux-x86-64.so.2",
-            "1: `rustup toolchain add stable-x86_64-unknown-linux-gnu --profile minimal` failed with exit status: 1",
-        ] {
-            let failure = json!({"output_tail": [line]});
-            assert!(needed_x86_64(&failure), "{line}");
-            // Said only where the job container is arm64: on an x86_64
-            // machine the same line has another cause.
-            assert_eq!(note_after(line).contains("x86_64"), HOST_IS_ARM64, "{line}");
-        }
-        assert!(!note_after("error[E0308]: mismatched types").contains("x86_64"));
+        // Rosetta's line says so on any machine.
+        let rosetta = "rosetta error: failed to open elf at /lib64/ld-linux-x86-64.so.2";
+        assert!(needed_x86_64(&json!({"output_tail": [rosetta]}), false));
+        assert!(note_after(rosetta).contains(NEEDS_X86_64_NOTE), "{rosetta}");
+        // The rustup line only where the job container is arm64: on an
+        // x86_64 machine the same line has another cause. The note quotes
+        // the line, which names x86_64 itself, so look for the note's own
+        // words.
+        let rustup = "1: `rustup toolchain add stable-x86_64-unknown-linux-gnu --profile minimal` failed with exit status: 1";
+        let failure = json!({"output_tail": [rustup]});
+        assert!(needed_x86_64(&failure, true));
+        assert!(!needed_x86_64(&failure, false));
+        assert_eq!(
+            note_after(rustup).contains(NEEDS_X86_64_NOTE),
+            HOST_IS_ARM64,
+            "{rustup}"
+        );
+        assert!(!note_after("error[E0308]: mismatched types").contains(NEEDS_X86_64_NOTE));
         // A bad shebang or a broken binary says this on any machine.
-        assert!(!note_after("./run.sh: exec format error").contains("x86_64"));
+        assert!(!note_after("./run.sh: exec format error").contains(NEEDS_X86_64_NOTE));
     }
 
     /// GitHub trims a job's name: a folded `name: >` ends in a newline,

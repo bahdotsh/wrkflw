@@ -1,6 +1,6 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-23 13:13:27 UTC | Files: 282 | Lines: 128966
+> Generated: 2026-11-26 09:05:12 UTC | Files: 282 | Lines: 129058
 > Languages: JSON (4), Markdown (35), Rust (176), Shell (10), TOML (19), YAML (38)
 
 ## Directory Structure
@@ -480,7 +480,7 @@ wrkflw/
 - `pub const CONTAINER_GITHUB_DIR: &str = "/github/workflow"`
 - `pub fn apply_github_container_context(env: &mut HashMap<String, String>)`
 - `pub const IMAGE_OS: &str = "ubuntu24"`
-- `pub fn image_os(runs_on: &str) -> &'static str`
+- `pub fn image_os(runs_on: &str) -> String`
 - `pub fn set_image_os( env: &mut HashMap<String, String>, user_env: &HashMap<String, String>, runs_on: &Option<Vec<String>>, )`
 - `pub fn apply_gitlab_container_context(env: &mut HashMap<String, String>)`
 - `pub struct RunRef<'a>`
@@ -1906,7 +1906,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 308.4 KB | **Lines:** 11266
+**Language:** Markdown | **Size:** 308.6 KB | **Lines:** 11272
 
 **Declarations:**
 
@@ -2963,7 +2963,7 @@ wrkflw/
 
 ## crates/executor/src/environment.rs
 
-**Language:** Rust | **Size:** 23.4 KB | **Lines:** 710
+**Language:** Rust | **Size:** 23.9 KB | **Lines:** 717
 
 **Imports:**
 - `chrono::Utc`
@@ -7043,7 +7043,7 @@ wrkflw/
 
 ## crates/trigger-filter/src/model.rs
 
-**Language:** Rust | **Size:** 19.8 KB | **Lines:** 516
+**Language:** Rust | **Size:** 21.7 KB | **Lines:** 567
 
 **Imports:**
 - `glob::{MatchOptions, Pattern, PatternError}`
@@ -7094,6 +7094,8 @@ wrkflw/
 `fn expand_inner_double_stars(source: &str) -> Result<Vec<String>, PatternError>`
 
 `fn inner_double_star_pieces(component: &str) -> Option<Vec<&str>>`
+
+`fn star_runs(component: &str) -> Vec<(usize, usize)>`
 
 `fn same_length_check(source: &str) -> String`
 
@@ -9194,7 +9196,7 @@ wrkflw/
 
 ## crates/wrkflw/src/compare_cmd.rs
 
-**Language:** Rust | **Size:** 98.8 KB | **Lines:** 2438
+**Language:** Rust | **Size:** 100.4 KB | **Lines:** 2464
 
 **Imports:**
 - `crate::git::line as git_line`
@@ -9257,9 +9259,15 @@ wrkflw/
 
 `fn lacked_service_token(failure: &Value) -> bool`
 
-`const NEEDS_X86_64: &[&str] = &[ "rosetta error: failed to open elf at /lib64/ld-linux-x86-64.so.2", "toolchain add stable-x86_64-unknown-linux-gnu", ]`
+`const ROSETTA_NEEDS_X86_64: &str = "rosetta error: failed to open elf at /lib64/ld-linux-x86-64.so.2"`
 
-`fn needed_x86_64(failure: &Value) -> bool`
+`const RUSTUP_NEEDS_X86_64: &str = "toolchain add stable-x86_64-unknown-linux-gnu"`
+
+`const HOST_IS_ARM64: bool = cfg!(target_arch = "aarch64")`
+
+`fn needed_x86_64(failure: &Value, host_is_arm64: bool) -> bool`
+
+`const NEEDS_X86_64_NOTE: &str = "a step ran an x86_64 program, as `cross` does, which this \ machine's arm64 job container can't run`
 
 `const QUOTED_LINE_CHARS: usize = 200`
 
@@ -10602,7 +10610,7 @@ wrkflw/
 
 ## crates/wrkflw/tests/needs_failure_propagation_test.rs
 
-**Language:** Rust | **Size:** 14.2 KB | **Lines:** 605
+**Language:** Rust | **Size:** 14.2 KB | **Lines:** 607
 
 **Imports:**
 - `std::fs`

@@ -5506,22 +5506,31 @@ fn checkout_destination(ctx: &StepExecutionContext<'_>) -> Result<PathBuf, Strin
     }
     let destination = ctx.working_dir.join(relative);
     // A link already in the workspace may lead out of it: what exists of
-    // the path is checked where it really is.
-    if let Ok(root) = ctx.working_dir.canonicalize() {
-        let existing = destination
-            .ancestors()
-            .find(|part| part.symlink_metadata().is_ok());
-        let inside = existing
-            .map(|part| {
-                part.canonicalize()
-                    .is_ok_and(|real| real.starts_with(&root))
-            })
-            .unwrap_or(true);
-        if !inside {
+    // the path is checked where it really is. A workspace that doesn't
+    // exist yet holds no link; one that can't be resolved for another
+    // reason can't be checked, so the path is refused.
+    let root = match ctx.working_dir.canonicalize() {
+        Ok(root) => root,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(destination),
+        Err(e) => {
             return Err(format!(
-                "actions/checkout: path '{path}' leads out of the workspace through a link"
+                "actions/checkout: can't check that path '{path}' stays in the workspace: {e}"
             ));
         }
+    };
+    let existing = destination
+        .ancestors()
+        .find(|part| part.symlink_metadata().is_ok());
+    let inside = existing
+        .map(|part| {
+            part.canonicalize()
+                .is_ok_and(|real| real.starts_with(&root))
+        })
+        .unwrap_or(true);
+    if !inside {
+        return Err(format!(
+            "actions/checkout: path '{path}' leads out of the workspace through a link"
+        ));
     }
     Ok(destination)
 }
@@ -16011,6 +16020,34 @@ runs:
         assert!(destination("out").is_err());
         assert_eq!(destination("in/repo"), Ok(working_dir.join("in/repo")));
         assert_eq!(destination("new/repo"), Ok(working_dir.join("new/repo")));
+    }
+
+    /// A workspace that exists but can't be resolved can't be checked for
+    /// links, so a `path:` into it is refused; one not made yet holds none.
+    #[cfg(unix)]
+    #[test]
+    fn checkout_path_into_an_unresolvable_workspace_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let working_dir = parent.path().join("ws");
+        fs::create_dir(&working_dir).unwrap();
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads through any mode: nothing to test there.
+        let unresolvable = working_dir.canonicalize().is_err();
+        let job_env = HashMap::new();
+        let refused = with_checkout_ctx(&job_env, &working_dir, &[("path", "sub")], |ctx| {
+            checkout_destination(ctx)
+        });
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        if unresolvable {
+            let message = refused.unwrap_err();
+            assert!(message.contains("can't check"), "{message}");
+        }
+        let missing = parent.path().join("not-yet");
+        let made_later = with_checkout_ctx(&job_env, &missing, &[("path", "sub")], |ctx| {
+            checkout_destination(ctx)
+        });
+        assert_eq!(made_later, Ok(missing.join("sub")));
     }
 
     #[tokio::test]

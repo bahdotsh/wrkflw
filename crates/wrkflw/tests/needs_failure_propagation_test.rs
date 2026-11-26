@@ -378,18 +378,20 @@ async fn reusable_workflow_jobs_skip_after_failed_need() {
     // was killed leaves its directory behind: clear those out, but not one
     // young enough to belong to a run going on now.
     for entry in std::fs::read_dir(".").unwrap().flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".needs-reusable-")
+        {
+            continue;
+        }
         let stale = entry
             .metadata()
             .and_then(|meta| meta.modified())
             .ok()
             .and_then(|modified| modified.elapsed().ok())
             .is_some_and(|age| age > std::time::Duration::from_secs(3600));
-        if stale
-            && entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".needs-reusable-")
-        {
+        if stale {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
